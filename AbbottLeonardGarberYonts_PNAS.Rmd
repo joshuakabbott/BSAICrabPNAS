@@ -1,0 +1,2231 @@
+---
+title: "Replication code: Who gets what from fisheries reform"
+author: "Joshua Abbott"
+date: "11/19/2021"
+output: html_document
+---
+
+Note: This file utilizes confidential fisheries data which can only be obtained by agreement with NOAA Fisheries.  This code produces the results in the paper conditional on having these data in the form obtained by the authors. 
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+rm(list=ls(all=TRUE))
+#Load packages----------------------#
+library(pacman)
+p_load(tidyverse, haven, readxl, ggpubr, RColorBrewer, knitr, xtable, Hmisc, plm, broom, ggpubr, estimatr, quantreg, texreg, fastDummies, rsq, ggridges, stats)
+
+nfdays <- FALSE #TRUE - Correct wage calculations to include non-fishing days. The default in the paper is FALSE. 
+
+#Directory for the export of figures/tables - change to your directory
+export.base <- "/Users/josh/Dropbox (ASU)"
+```
+
+
+```{r data.import, include=FALSE, cache=TRUE}
+
+#Load data-------------------------#
+#EDR plus data# These are the confidential annual survey data described in the paper. 
+edr <- read_dta("data/edrplus.dta")
+
+#Alaska fuel prices - http://www.psmfc.org/efin/data/fuel.html
+fuelak <- read_xlsx("data/fuelak.xlsx", col_names=TRUE)
+
+#Consumer Price index from BLS
+cpi <- read_xlsx("data/CPIdata.xlsx", sheet="screened", col_names= TRUE)
+
+#Public data on total allowable catches
+tac <- read_dta("data/TAC.dta")
+
+#BLS Current Population Survey median weekly wage data by occupational category. These data are aggregated together into a single spreadsheet and deflated by CPI. 
+bls <- read_xlsx("data/BLS/CPS_medweeklywage.xlsx", sheet="cpi_deflated_day", col_names=TRUE)
+
+#Merge CPI to edr
+edr <- edr %>% left_join(select(cpi,year,CPI2004),by="year")
+edr %>% count(is.na(CPI2004))
+
+fuelak <- fuelak %>% filter(PORT=="DUT", YEAR<=2017) %>% group_by(YEAR, MONTH) %>% summarise(pricegal = mean(PRICEGAL)) %>% group_by(YEAR) %>% summarise(pricegal= mean(pricegal)) %>% rename(year=YEAR) %>% left_join(select(cpi,year,CPI2004),by="year") %>% mutate(pricegal=pricegal/CPI2004) %>% select(year, pricegal)
+
+#Create deflated (2004) versions of monetary variables
+edrd <- edr %>% mutate(exvrev=round(exvrev/CPI2004),
+                       ifqa_edr_sold_rev=round(ifqa_edr_sold_rev/CPI2004),
+                       ifqb_edr_sold_rev=round(ifqb_edr_sold_rev/CPI2004),
+                       ifqc_edr_sold_rev=round(ifqc_edr_sold_rev/CPI2004),
+                       ifqa_edr_lease_cost=round(ifqa_edr_lease_cost/CPI2004),
+                       ifqb_edr_lease_cost=round(ifqb_edr_lease_cost/CPI2004),
+                       ifqc_edr_lease_cost=round(ifqc_edr_lease_cost/CPI2004),
+                       cpo_edr_sold_rev=round(cpo_edr_sold_rev/CPI2004),
+                       cpo_edr_lease_cost=round(cpo_edr_lease_cost/CPI2004),
+                       cdq_edr_sold_rev=round(cdq_edr_sold_rev/CPI2004),
+                       cdq_edr_lease_cost=round(cdq_edr_lease_cost/CPI2004),
+                       qscost=round(qscost/CPI2004),
+                       baitcost=round(baitcost/CPI2004),
+                       fuelcost=round(fuelcost/CPI2004),
+                       prvncost=round(prvncost/CPI2004),
+                       captcost=round(captcost/CPI2004),
+                       crewcost=round(crewcost/CPI2004)
+                       )
+rm(cpi,edr)
+
+#Create new TOTAL variables
+edrd <- edrd %>% mutate(opnrev = exvrev - baitcost - fuelcost - prvncost - captcost - crewcost, #operating variable net revenue, no quota costs
+                        worker = captcost + crewcost,
+                        ownerreturn = opnrev - qscost,
+                        cost_nocrew = baitcost + fuelcost + prvncost,
+                        nrev_nocrew = exvrev - baitcost - fuelcost - prvncost,
+                        mtons = exvlb/2204.62,
+                        yr_bbr = relevel(factor(year),"2005"), #set base to first rationalized calendar year for BBR & BSS
+                        yr_bss = relevel(factor(year),"2006")
+                        
+                        )
+
+#Create season variable that ascribes 2004 BBR to 2005 season to pair with BSS. So participation in both BBR and BSS in 2005 requires positive EDR reportings for BBR in 2004 and positive recordings for BSS in 2005. An implication of this method is that there is no ability to determine joint seasonal participation in both fisheries in the pre-rationalization EDR since the survey years aren't consecutive (1998, 2001, 2004)
+
+edrd <- edrd %>% mutate(season = ifelse(fishery_code=="BBR", year + 1, year))
+
+#Create new RATE variables for individual fisheries data
+edrd <- edrd %>% mutate(
+                        crewpay_pc = crewcost/crewcount,
+                        crewpay_revshare = crewcost/exvrev,
+                        crewpay_pc_revshare = crewpay_pc/exvrev,
+                        crewpay_nrevshare = crewcost/nrev_nocrew,
+                        crewpay_pc_nrevshare = crewpay_pc/nrev_nocrew,
+                        captpay_revshare = captcost/exvrev,
+                        captpay_nrevshare = captcost/nrev_nocrew,
+                        worker_nrevshare = crewpay_nrevshare+captpay_nrevshare,
+                        revlb = exvrev/exvlb, #self-reported in EDR
+                        revmt = revlb*2204.62, 
+                        nrev_nocrewmt = nrev_nocrew/mtons,
+                        cost_nocrew_share = cost_nocrew/exvrev, 
+                        nrev_nocrew_share = nrev_nocrew/exvrev,
+                        crewpay_pc_wt = crewpay_pc/revmt,
+                        crewpay_wt = crewcost/revmt,
+                        captpay_wt = captcost/revmt,
+                        crewwage = crewpay_pc/tripd,
+                        crewwage_wt = crewwage/revmt,
+                        captwage = captcost/tripd,
+                        captwage_wt = captwage/revmt,
+                        crewdays = crewcount*tripd,
+                        crewdays_mt = crewdays/mtons,
+                        piecerate = crewpay_pc/mtons,
+                        piecerate_wt = crewpay_pc_wt/mtons,
+                        capt_piecerate = captcost/mtons,
+                        capt_piecerate_wt = captpay_wt/mtons,
+                        nrev_nocrew_day = nrev_nocrew/tripd,
+                        nrev_nocrew_day_wt = nrev_nocrew_day/revmt,
+                        vprod = mtons/tripd,
+                        crewprod = mtons/crewdays, 
+                        qspriceMT = (qscost/qslb)*2204.62,
+                        qsevratio = qspriceMT/revmt,
+                        qsnrevratio = qspriceMT/nrev_nocrewmt,
+                        qsopnrevratio = qspriceMT/(opnrev/mtons),
+                        leasedratio = qslb/exvlb,
+                        leasedshrev = qscost/exvrev,
+                        leasedshnrev = qscost/nrev_nocrew,
+                        crewshare_resid = crewwage/(revmt*nrev_nocrew_share*crewprod),
+                        crewshare_residpc = crewshare_resid/crewcount,
+                        captshare_resid = captwage/(revmt*nrev_nocrew_share*vprod), 
+                        ownerreturn_MT = ownerreturn/mtons, 
+                        ownerreturn_wage = ownerreturn/tripd, 
+                        capitalreturn_MT = opnrev/mtons,
+                        capitalreturn_wage = opnrev/tripd, 
+                        owner_nrevshare = ownerreturn/nrev_nocrew,
+                        leased_nrevshare = qscost/nrev_nocrew
+                        )
+
+
+
+#Now create summary (total) EDR data - by vesselXyear - of BBR + BSS where appropriate as well as appropriate rate data. 
+bbr_bss_edrd <- edrd %>% filter(fishery_code=="BBR" | fishery_code=="BSS") %>% group_by(adfg_number_e, season) %>% summarise(
+    exvlb = sum(exvlb),
+    exvrev = sum(exvrev),
+    qslb = sum(qslb),
+    qscost = sum(qscost),
+    baitcost = sum(baitcost),
+    fuelcost = sum(fuelcost),
+    prvncost = sum(prvncost),
+    captcost = sum(captcost),
+    crewcost = sum(crewcost),
+    tripd = sum(tripd),
+    etripd = sum(etripd),
+    ftripd = sum(ftripd),
+    opnrev = sum(opnrev),
+    cost_nocrew = sum(cost_nocrew),
+    nrev_nocrew = sum(nrev_nocrew),
+    mtons = sum(mtons), 
+    crewpay_pc = sum(crewcost/crewcount), #This variable has a slightly awkward interpetation of being the seasonal pay of a crew earning the average rate in all fisheries. 
+    crewdays = sum(crewcount*tripd)
+    
+) %>% 
+      mutate(fishery_code="BBR/BSS")
+
+bbr_bss_edrd <- bbr_bss_edrd %>% mutate( 
+  crewpay_revshare = crewcost/exvrev,
+  crewpay_nrevshare = crewcost/nrev_nocrew,
+  crewpay_pc_nrevshare = crewpay_pc/nrev_nocrew,
+  crewpay_pc_revshare = crewpay_pc/exvrev,
+  revlb = exvrev/exvlb,
+  revmt = revlb*2204.62,
+  cost_nocrew_share = cost_nocrew/exvrev, 
+  nrev_nocrew_share = nrev_nocrew/exvrev,
+  crewpay_pc_wt = crewpay_pc/revmt, 
+  crewpay_wt = crewcost/revmt,
+  crewwage = crewpay_pc/tripd,
+  crewwage_wt = crewwage/revmt,
+  crewdays_mt = crewdays/mtons,
+  piecerate = crewpay_pc/mtons, #Interpretation is the piece-rate pay for a crew that persists in all fisheries and earns the average rate per fishery. 
+  vprod = mtons/tripd,
+  crewprod = mtons/crewdays
+    )
+
+#Now create summary (total) EDR data - by vesselXyear - of all crab fisheries where appropriate. 
+#IMPORTANT: CHECK WITH BGY ABOUT VALIDITY OF THIS AS THE SEASON IS CURRENTLY DEFINED BY CALENDAR YEAR EXCEPT FOR BBR. 
+allcrab_edrd <- edrd %>% group_by(adfg_number_e, season) %>%  summarise(
+    exvlb = sum(exvlb),
+    exvrev = sum(exvrev),
+    qslb = sum(qslb),
+    qscost = sum(qscost),
+    baitcost = sum(baitcost),
+    fuelcost = sum(fuelcost),
+    prvncost = sum(prvncost),
+    captcost = sum(captcost),
+    crewcost = sum(crewcost),
+    tripd = sum(tripd),
+    etripd = sum(etripd),
+    ftripd = sum(ftripd),
+    opnrev = sum(opnrev),
+    cost_nocrew = sum(cost_nocrew),
+    nrev_nocrew = sum(nrev_nocrew),
+    mtons = sum(mtons),
+    crewpay_pc = sum(crewcost/crewcount),
+    crewdays = sum(crewcount*tripd)
+
+) %>% 
+      mutate(fishery_code="ALL")
+
+allcrab_edrd <- allcrab_edrd %>% mutate( 
+  crewpay_revshare = crewcost/exvrev,
+  crewpay_nrevshare = crewcost/nrev_nocrew,
+  crewpay_pc_nrevshare = crewpay_pc/nrev_nocrew,
+  crewpay_pc_revshare = crewpay_pc/exvrev,
+  revlb = exvrev/exvlb,
+  revmt = revlb*2204.62,
+  cost_nocrew_share = cost_nocrew/exvrev, 
+  nrev_nocrew_share = nrev_nocrew/exvrev,
+  crewpay_pc_wt = crewpay_pc/revmt, 
+  crewpay_wt = crewcost/revmt,
+  crewwage = crewpay_pc/tripd,
+  crewwage_wt = crewwage/revmt,
+  crewdays_mt = crewdays/mtons,
+  piecerate = crewpay_pc/mtons, #Interpretation is the piece-rate pay for a crew that persists in all fisheries and earns the average rate per fishery. 
+  vprod = mtons/tripd,
+  crewprod = mtons/crewdays
+    )
+                 
+###################################################          
+
+#Append summaries to edrd data. 
+edrd <- bind_rows(edrd, bbr_bss_edrd) %>% arrange(adfg_number_e, season, fishery_code) %>% select(adfg_number_e, season, fishery_code, everything())
+
+#Reorder data columns to have adfg and then year - handy for plm package
+edrd <- edrd %>% select(adfg_number_e,year, fishery_code, everything())
+
+#List of ADFGs present in SOME crab fishery for at least one post-rat year. 
+persist1 <- edrd %>% group_by(adfg_number_e) %>% filter(year>=2006) %>% filter(row_number()==1) %>% select(adfg_number_e)
+#List of ADFGs present in SOME crab fishery on both sides of rationalization
+persist2 <- edrd %>% group_by(adfg_number_e) %>% filter(max(year)>=2006 & min(year)<=2004) %>% filter(row_number()==1) %>% select(adfg_number_e)
+
+#Create variables indicating participation in BBR, BSS, both, or neither in a given year
+
+edrd <- edrd %>% group_by(adfg_number_e, season) %>% mutate(
+  bbrbsspart = case_when(
+  any(fishery_code=="BBR") & any(fishery_code=="BSS") ~"Both BSS and BBR", 
+  any(fishery_code=="BSS") & all(fishery_code!="BBR") ~ "BSS no BBR",
+  any(fishery_code=="BBR") & all(fishery_code!="BSS") ~ "BBR no BSS",
+  TRUE ~ "Neither BBR nor BSS")
+  )
+edrd <- ungroup(edrd)
+
+#Add manual dummy variables for year - comes in handy sometimes
+edrd <- edrd %>% mutate(y=year)
+edrd <- dummy_cols(edrd, select_columns=c("y"))
+edrd <- edrd %>% select(-y)
+
+#Add pre/post rationalization dummy
+edrd <- edrd %>% mutate(postCR = case_when(
+  year>2004 & fishery_code=="BBR" ~ "AFTER",
+  year>2005 & fishery_code=="BSS" ~ "AFTER",
+  TRUE ~ "BEFORE"))
+edrd <- edrd %>% mutate(postCR = factor(postCR,levels = c("BEFORE", "AFTER")))
+
+#Add pre-rationalization remuneration outcomes to all observations
+temp <- edrd %>% filter(postCR=="BEFORE") %>% group_by(adfg_number_e,fishery_code) %>% 
+  summarise(med_pre_crewwage = median(crewwage, na.rm="TRUE"),
+            med_pre_captwage = median(captwage, na.rm="TRUE"),
+            #med_pre_ownerreturn = median(ownerreturn, na.rm = "TRUE"),
+            #med_pre_opnrev = median(opnrev, na.rm="TRUE"),
+            med_pre_ownerreturn = median(ownerreturn_wage, na.rm="TRUE"),
+            med_pre_opnrev = median(capitalreturn_wage, na.rm="TRUE"),
+            med_pre_crewwageCE = median(crewwage/revmt, na.rm="TRUE"),
+            med_pre_captwageCE = median(captwage/revmt, na.rm="TRUE"),
+            med_pre_ownerreturnCE = median(ownerreturn/revmt, na.rm = "TRUE"),
+            med_pre_opnrevCE = median(opnrev/revmt, na.rm="TRUE")
+            )
+edrd <- edrd %>% left_join(temp,by=c("adfg_number_e","fishery_code"))
+rm(temp)
+
+edrd <- edrd %>% mutate(
+  crewwage_prepost = log(crewwage) - log(med_pre_crewwage),
+  captwage_prepost = log(captwage) - log(med_pre_captwage),
+  ownerreturn_prepost = log(ownerreturn) - log(med_pre_ownerreturn),
+  crewwage_gtbefore = ifelse((crewwage - med_pre_crewwage)>0,1,0),
+  captwage_gtbefore = ifelse((captwage - med_pre_captwage)>0,1,0),
+  #ownerreturn_gtbefore = ifelse((ownerreturn - med_pre_ownerreturn)>0,1,0),
+  #capitalreturn_gtbefore = ifelse((opnrev - med_pre_opnrev)>0,1,0),
+  ownerreturn_gtbefore = ifelse((ownerreturn_wage - med_pre_ownerreturn)>0,1,0),
+  capitalreturn_gtbefore = ifelse((capitalreturn_wage- med_pre_opnrev)>0,1,0),
+  crewwageCE_gtbefore = ifelse((crewwage/revmt - med_pre_crewwageCE)>0,1,0),
+  captwageCE_gtbefore = ifelse((captwage/revmt - med_pre_captwageCE)>0,1,0),
+  ownerreturnCE_gtbefore = ifelse((ownerreturn/revmt - med_pre_ownerreturnCE)>0,1,0),
+    capitalreturnCE_gtbefore = ifelse((opnrev/revmt - med_pre_opnrevCE)>0,1,0),
+)
+  
+##################################################
+#Create corrections for non-fishing days if this is desired (comment out otherwise)
+##################################################
+
+if (nfdays==TRUE) {
+in.dutch = 8 #assumed days in AK harbor before fishing for both BBR and BSS
+in.shipyard = 5 #assumed non-wage days in shipyard before entire season - prorated over BBR and BSS by length of time in each
+frac.shipyard = 0.8 #fraction of crew doing the shipyard work
+frac.dutch = 1 #fraction of crew required to be in AK harbor before fishing
+
+edrd <- edrd %>% filter(fishery_code=="BBR" | fishery_code=="BSS") %>% group_by(adfg_number_e, year) %>% mutate(share_days_fishery = tripd/sum(tripd)) %>% ungroup()
+edrd <- edrd %>% mutate(
+  nonfishing_days = in.dutch + in.shipyard*share_days_fishery,
+  nonfishing_crewdays = (in.dutch*frac.dutch + in.shipyard*share_days_fishery*frac.shipyard)*crewcount,
+  fishing_crewdays = crewcount*tripd,
+  share_nonfishing_crewdays = nonfishing_crewdays/(nonfishing_crewdays+fishing_crewdays),
+  crewwage = crewcost/(fishing_crewdays+nonfishing_crewdays),
+  captwage = captcost/(tripd+nonfishing_days)
+)
+
+temp <- edrd %>% filter(postCR=="BEFORE") %>% group_by(adfg_number_e,fishery_code) %>% 
+  summarise(med_pre_crewwage = median(crewwage, na.rm="TRUE"),
+            med_pre_captwage = median(captwage, na.rm="TRUE"),
+            med_pre_ownerreturn = median(ownerreturn_wage, na.rm="TRUE"),
+            med_pre_opnrev = median(capitalreturn_wage, na.rm="TRUE"),
+            med_pre_crewwageCE = median(crewwage/revmt, na.rm="TRUE"),
+            med_pre_captwageCE = median(captwage/revmt, na.rm="TRUE"),
+            med_pre_ownerreturnCE = median(ownerreturn/revmt, na.rm = "TRUE"),
+            med_pre_opnrevCE = median(opnrev/revmt, na.rm="TRUE")
+            )
+edrd <- edrd %>% left_join(temp,by=c("adfg_number_e","fishery_code"))
+rm(temp)
+
+edrd <- edrd %>% mutate(
+  crewwage_prepost = log(crewwage) - log(med_pre_crewwage),
+  captwage_prepost = log(captwage) - log(med_pre_captwage),
+  ownerreturn_prepost = log(ownerreturn) - log(med_pre_ownerreturn),
+  crewwage_gtbefore = ifelse((crewwage - med_pre_crewwage)>0,1,0),
+  captwage_gtbefore = ifelse((captwage - med_pre_captwage)>0,1,0),
+  ownerreturn_gtbefore = ifelse((ownerreturn_wage - med_pre_ownerreturn)>0,1,0),
+  capitalreturn_gtbefore = ifelse((capitalreturn_wage- med_pre_opnrev)>0,1,0),
+  crewwageCE_gtbefore = ifelse((crewwage/revmt - med_pre_crewwageCE)>0,1,0),
+  captwageCE_gtbefore = ifelse((captwage/revmt - med_pre_captwageCE)>0,1,0),
+  ownerreturnCE_gtbefore = ifelse((ownerreturn/revmt - med_pre_ownerreturnCE)>0,1,0),
+    capitalreturnCE_gtbefore = ifelse((opnrev/revmt - med_pre_opnrevCE)>0,1,0),
+)
+  
+}
+
+#Create subset of final edrd data for ease of analysis (THIS SHOULD ALWAYS COME LAST AFTER ANY OTHER ADDITIONS TO EDRD)
+redsnow <- edrd %>% filter(fishery_code %in% c("BBR","BSS")) 
+
+
+#################################################################################
+###Create remuneration specific data####
+#Data that are purged of observations with any missing remuneration data and that only look at vessels present after rationalization
+
+
+remun <- edrd %>% 
+  filter(is.na(crewpay_pc)==FALSE & is.finite(crewpay_pc)==TRUE) %>% 
+  filter(is.na(crewpay_revshare)==FALSE & is.finite(crewpay_revshare)==TRUE) %>% 
+  filter(is.na(crewpay_nrevshare)==FALSE & is.finite(crewpay_nrevshare)==TRUE) %>% 
+  filter(is.na(crewpay_wt)==FALSE & is.finite(crewpay_wt)==TRUE) %>% 
+  filter(is.na(crewwage_wt)==FALSE & is.finite(crewwage_wt)==TRUE) %>%
+  filter(is.na(piecerate)==FALSE & is.finite(piecerate)==TRUE) %>% 
+  filter(is.na(captcost)==FALSE & is.finite(captcost)==TRUE) %>% 
+  filter(is.na(captpay_revshare)==FALSE & is.finite(captpay_revshare)==TRUE) %>% 
+  filter(is.na(captpay_nrevshare)==FALSE & is.finite(captpay_nrevshare)==TRUE) %>% 
+  filter(is.na(captpay_nrevshare)==FALSE & is.finite(captpay_nrevshare)==TRUE) %>% 
+  filter(is.na(captpay_wt)==FALSE & is.finite(captpay_wt)==TRUE) %>% 
+  filter(is.na(captwage)==FALSE & is.finite(captwage)==TRUE) %>% 
+  filter(is.na(captwage_wt)==FALSE & is.finite(captwage_wt)==TRUE) %>% 
+  filter(is.na(capt_piecerate)==FALSE & is.finite(capt_piecerate)==TRUE) %>% 
+  filter(is.na(capt_piecerate_wt)==FALSE & is.finite(capt_piecerate_wt)==TRUE) %>% 
+  filter(adfg_number_e %in% persist1$adfg_number_e)
+
+remun_bbr <- remun %>% filter(fishery_code=="BBR") %>% mutate(omargin = nrev_nocrew/exvrev)
+remun_bss <- remun %>% filter(fishery_code=="BSS") %>% mutate(omargin = nrev_nocrew/exvrev)
+remun_bbrbss <- remun %>% filter(fishery_code %in% c("BBR","BSS")) 
+
+#Same data but as a panel data frame for plm
+remun_bbr_xt <- pdata.frame(remun_bbr) 
+remun_bss_xt <- pdata.frame(remun_bss)
+
+############TAC data###########
+
+# In making this figure I've assigned BBR the "y1" date - the beginning year of the season - and have assigned BSS the ending year (y2) in the season. This at least makes the best overall correspondence to the EDR reporting. 
+
+tac_bbr_bss <- tac %>% filter(fishery_code %in% c("BBR","BSS") & y1>=1998) %>% select(CRAB_SEASON, y1, y2, fishery_code, tac_ghl, ifq, cdq) %>% mutate(tac_ghl=as.numeric(tac_ghl)) #due to non-numeric values  in other fisheries tac_ghl is not stored as numeric
+
+tac_bbr_bss <- tac_bbr_bss %>% mutate(season = ifelse(fishery_code=="BBR",y1,ifelse(fishery_code=="BSS" & is.na(y2)==TRUE,y1,y2)),
+                                      year = season) %>% arrange(fishery_code,season)
+
+```
+
+
+# Figure 1 and S1
+```{r summfig, echo=TRUE, warning=FALSE, message=FALSE}
+summ_fishery_year <- redsnow %>% group_by(fishery_code,year) %>% 
+  filter(!is.na(exvrev) & exvrev!=0) %>% 
+  summarise(vessels=n(),
+            jobs = sum(crewcount),
+            crewdays =sum(crewdays),
+            mtons = sum(mtons), 
+            nrev_nocrew = sum(nrev_nocrew))
+summ_fishery_year <- summ_fishery_year %>% mutate(crewdays_mt = crewdays/mtons)
+
+axescolor.bbr <- c("gray","gray","gray","black","black","black","black","black","black","black","black","black","black","black","black","black")
+
+axescolor.bss <- c("gray","gray","gray","gray","black","black","black","black","black","black","black","black","black","black","black","black")
+
+joint <- summ_fishery_year %>% left_join(select(tac_bbr_bss,fishery_code, year, tac_ghl),by=c("fishery_code","year"))
+
+joint <- joint %>% group_by(fishery_code) %>% mutate(
+  vess_norm = ifelse(fishery_code=="BBR", vessels/vessels[year==2005],  vessels/vessels[year==2006]),
+  positions_norm = ifelse(fishery_code=="BBR", jobs/jobs[year==2005],  jobs/jobs[year==2006]),
+  crewdays_norm = ifelse(fishery_code=="BBR", crewdays/crewdays[year==2005],  crewdays/crewdays[year==2006]),
+  tac_norm = ifelse(fishery_code=="BBR", tac_ghl/tac_ghl[year==2005],  tac_ghl/tac_ghl[year==2006]), 
+  nrev_norm = ifelse(fishery_code=="BBR", nrev_nocrew/nrev_nocrew[year==2005],  nrev_nocrew/nrev_nocrew[year==2006]))
+
+##################################
+#Individual plots
+##################################
+
+trends_bbr <- joint %>% filter(fishery_code=="BBR") %>% ggplot(aes(x=year)) +
+  geom_line(aes(y=tac_norm, linetype="TAC", color="TAC")) + 
+  geom_line(aes(y=vess_norm, linetype="Vessels", color="Vessels")) + 
+  geom_line(aes(y=positions_norm, linetype="Positions", color="Positions")) +
+  geom_line(aes(y=crewdays_norm, linetype="Crew days", color="Crew days")) +
+  # geom_line(aes(y=nrev_norm, linetype="Net revenue (no crew or lease)", color="Net revenue (no crew or lease)")) +
+    geom_line(aes(y=nrev_norm, linetype="Contribution margin (no crew/lease)", color="Contribution margin (no crew/lease)")) +
+  geom_point(aes(y=tac_norm, color="TAC")) + 
+  geom_point(aes(y=vess_norm, color="Vessels")) + 
+  geom_point(aes(y=positions_norm, color="Positions")) +
+  geom_point(aes(y=crewdays_norm, color="Crew days")) +
+  # geom_point(aes(y=nrev_norm, color="Net revenue (no crew or lease)")) +
+  geom_point(aes(y=nrev_norm, color="Contribution margin (no crew/lease)")) +
+  theme_light() +labs(x="Year", y="Proportion (2005=1)") + rremove("legend.title") + scale_linetype(name="type") + scale_color_discrete(name="type") + theme(legend.position = "bottom") +
+scale_x_continuous(breaks=c(1998,2001,2004,2005, 2006, 2007, 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017)) + theme(axis.text.x = element_text(angle = 90, hjust = 1, color = axescolor.bbr), panel.grid.minor = element_blank())
+
+trends_bbr
+
+trends_bss <- joint %>% filter(fishery_code=="BSS") %>% ggplot(aes(x=year)) +
+  geom_line(aes(y=tac_norm, linetype="TAC", color="TAC")) + 
+  geom_line(aes(y=vess_norm, linetype="Vessels", color="Vessels")) + 
+  geom_line(aes(y=positions_norm, linetype="Positions", color="Positions")) +
+  geom_line(aes(y=crewdays_norm, linetype="Crew days", color="Crew days")) +
+  # geom_line(aes(y=nrev_norm, linetype="Net revenue (no crew or lease)", color="Net revenue (no crew or lease)")) +
+      geom_line(aes(y=nrev_norm, linetype="Contribution margin (no crew/lease)", color="Contribution margin (no crew/lease)")) +
+  geom_point(aes(y=tac_norm, color="TAC")) + 
+  geom_point(aes(y=vess_norm, color="Vessels")) + 
+  geom_point(aes(y=positions_norm, color="Positions")) +
+  geom_point(aes(y=crewdays_norm, color="Crew days")) +
+    # geom_point(aes(y=nrev_norm, color="Net revenue (no crew or lease)")) +
+  geom_point(aes(y=nrev_norm, color="Contribution margin (no crew/lease)")) +
+    theme_light() +labs(x="Year", y="Proportion (2006=1)") + rremove("legend.title") + scale_linetype(name="type") + scale_color_discrete(name="type") + theme(legend.position = "bottom")+
+scale_x_continuous(breaks=c(1998,2001,2004,2005, 2006, 2007, 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017)) + theme(axis.text.x = element_text(angle = 90, hjust = 1, color = axescolor.bss), panel.grid.minor = element_blank())
+
+trends_bss
+
+
+```
+
+
+# Figure S2
+
+```{r tripdays, echo=TRUE, warning=FALSE, message=FALSE}
+
+tripdays <- remun_bbrbss %>% ggplot(aes(x=factor(year), y=tripd, fill=fishery_code)) +
+  geom_boxplot(outlier.shape = NA) + 
+  theme_light() +
+  labs(x="year", y="Trip days", fill="Fishery") + facet_wrap(~fishery_code, scales = "free") + theme(axis.text.x = element_text(angle = 90, hjust = 1)) + rremove("legend.title")
+
+tripdays
+
+```
+
+# Figure S3
+```{r prices, echo=TRUE, warning=FALSE, message=FALSE}
+
+temp <-  remun_bbrbss %>% group_by(fishery_code,year) %>% summarise(price = weighted.mean(revlb,exvlb,na.rm = TRUE)) %>% bind_rows(fuelak) %>% mutate(labels = case_when(
+  is.na(fishery_code) ~ "Fuel: $/gal",
+  fishery_code == "BBR" ~ "BBR: $/lb",
+  fishery_code == "BSS" ~ "BSS: $/lb",
+  TRUE ~ "Nada"
+)) %>% 
+  mutate(price = if_else(is.na(fishery_code),pricegal,price)) %>% select(-pricegal)
+  
+prices <- temp %>% ggplot(aes(x=year, y=price, linetype = labels, color=labels)) + geom_line() + geom_point() + theme_light() + rremove("legend.title") + labs(x="Year", y = "Price")
+prices
+
+```
+
+# Figure S4
+```{r numcrew, echo=TRUE, warning=FALSE, message=FALSE}
+
+numcrew <- remun_bbrbss %>% ggplot(aes(x=factor(year), y=crewcount, fill=fishery_code)) +
+  #geom_jitter(color="gray",size=.5, width=0.2) + theme_light() +
+  stat_summary(aes(color=fishery_code),fun.data = "mean_sdl", fun.args = list(mult=1), geom="pointrange") +
+  coord_cartesian(ylim=c(2,10)) + facet_wrap(~fishery_code) + labs(x="Year",y="# Crew") + theme_light() + theme(axis.text.x = element_text(angle = 90, hjust = 1)) + rremove("legend.title")
+
+numcrew
+
+```
+
+
+# Figure S5
+
+```{r}
+axescolor <- c("gray","gray","gray","black","black","black","black","black","black","black","black","black","black","black","black","black")
+
+#Net revenue: before lease and crew costs
+a <- remun_bbrbss %>% filter(fishery_code=="BBR") %>% ggplot(aes(x=factor(year), y=nrev_nocrew)) + 
+  geom_boxplot(outlier.shape = NA) + 
+    stat_summary(fun.y=mean, geom="point", shape=20, size=2, color="red", fill="red") +
+  theme_minimal() +
+  labs(x="Year", y="$", title="Season") + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) + 
+  theme(axis.text.y = element_text(color = axescolor)) +
+  rremove("legend.title") + coord_flip(ylim=c(0,2750000))
+
+#a
+
+#Per day
+b <- remun_bbrbss %>% filter(fishery_code=="BBR") %>% ggplot(aes(x=factor(year), y=nrev_nocrew/tripd)) +
+  geom_boxplot(outlier.shape = NA) + 
+      stat_summary(fun.y=mean, geom="point", shape=20, size=2, color="red", fill="red") +
+  theme_minimal() +
+  labs(x="Year", y="$/day", title = "Per day") + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) + 
+  rremove("legend.title") + coord_flip()
+
+#b
+
+#Per MT
+
+c <- remun_bbrbss %>% filter(fishery_code=="BBR") %>% ggplot(aes(x=factor(year), y=nrev_nocrewmt)) +
+  geom_boxplot(outlier.shape = NA) + 
+      stat_summary(fun.y=mean, geom="point", shape=20, size=2, color="red", fill="red") +
+  theme_minimal() +
+  labs(x="Year", y="$/MT", title="Per MT") + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) + rremove("legend.title") +
+coord_flip(ylim=c(5000,22000))
+#c
+
+d <- ggarrange(a+theme(plot.margin=margin(r=1,l=1)),
+               b+theme(axis.text.y= element_blank(),
+                                   axis.ticks.y=element_blank(),
+                                   axis.title.y=element_blank(),
+                                   #axis.title.x=element_blank(),
+                                     plot.margin=margin(r=1,l=1)),
+               c+theme(axis.text.y= element_blank(),
+                                   axis.ticks.y=element_blank(),
+                                   axis.title.y=element_blank(),
+                                   #axis.title.x=element_blank(),
+                                     plot.margin=margin(r=1,l=1)),
+               nrow=1, ncol = 3, align = "h", widths = c(1.2,1,1))
+
+d
+
+
+```
+
+
+# Figure S6
+
+```{r}
+axescolor <- c("gray","gray","gray","black","black","black","black","black","black","black","black","black","black","black","black","black")
+
+#Net revenue: before lease and crew costs
+a <- remun_bbrbss %>% filter(fishery_code=="BBR") %>% ggplot(aes(x=factor(year), y=nrev_nocrew/revmt)) + 
+  geom_boxplot(outlier.shape = NA) + 
+    stat_summary(fun.y=mean, geom="point", shape=20, size=2, color="red", fill="red") +
+  theme_minimal() +
+  labs(x="Year", y="MT", title="Season") + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) + 
+  theme(axis.text.y = element_text(color = axescolor)) +
+  rremove("legend.title") + coord_flip(ylim=c(0,250))
+
+
+#a
+
+#Per day
+b <- remun_bbrbss %>% filter(fishery_code=="BBR") %>% ggplot(aes(x=factor(year), y=nrev_nocrew/(tripd*revmt))) +
+  geom_boxplot(outlier.shape = NA) + 
+      stat_summary(fun.y=mean, geom="point", shape=20, size=2, color="red", fill="red") +
+  theme_minimal() +
+  labs(x="Year", y="MT/day", title = "Per day") + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) + 
+  rremove("legend.title") + coord_flip(ylim=c(0,8))
+
+#b
+
+#Per MT
+
+c <- remun_bbrbss %>% filter(fishery_code=="BBR") %>% ggplot(aes(x=factor(year), y=nrev_nocrewmt/revmt)) +
+  geom_boxplot(outlier.shape = NA) + 
+      stat_summary(fun.y=mean, geom="point", shape=20, size=2, color="red", fill="red") +
+  theme_minimal() +
+  labs(x="Year", y="MT/MT", title="Per MT") + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) + rremove("legend.title") +
+coord_flip(ylim=c(0.75,1))
+#c
+
+d <- ggarrange(a+theme(plot.margin=margin(r=1,l=1)),
+               b+theme(axis.text.y= element_blank(),
+                                   axis.ticks.y=element_blank(),
+                                   axis.title.y=element_blank(),
+                                   #axis.title.x=element_blank(),
+                                     plot.margin=margin(r=1,l=1)),
+               c+theme(axis.text.y= element_blank(),
+                                   axis.ticks.y=element_blank(),
+                                   axis.title.y=element_blank(),
+                                   #axis.title.x=element_blank(),
+                                     plot.margin=margin(r=1,l=1)),
+               nrow=1, ncol = 3, align = "h", widths = c(1.2,1,1))
+
+d
+
+
+
+```
+
+# Figure S7
+
+```{r}
+axescolor <- c("gray","gray","gray","gray","black","black","black","black","black","black","black","black","black","black","black","black")
+
+#Net revenue: before lease and crew costs
+a <- remun_bbrbss %>% filter(fishery_code=="BSS") %>% ggplot(aes(x=factor(year), y=nrev_nocrew)) + 
+  geom_boxplot(outlier.shape = NA) + 
+    stat_summary(fun.y=mean, geom="point", shape=20, size=2, color="red", fill="red") +
+  theme_minimal() +
+  labs(x="Year", y="$", title="Season") + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) + 
+  theme(axis.text.y = element_text(color = axescolor)) +
+  rremove("legend.title") + coord_flip(ylim=c(0,3250000))
+
+#a
+
+#Per day
+b <- remun_bbrbss %>% filter(fishery_code=="BSS") %>% ggplot(aes(x=factor(year), y=nrev_nocrew/tripd)) +
+  geom_boxplot(outlier.shape = NA) + 
+      stat_summary(fun.y=mean, geom="point", shape=20, size=2, color="red", fill="red") +
+  theme_minimal() +
+  labs(x="Year", y="$/day", title = "Per day") + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) + 
+  rremove("legend.title") + coord_flip()
+
+#b
+
+#Per MT
+
+c <- remun_bbrbss %>% filter(fishery_code=="BSS") %>% ggplot(aes(x=factor(year), y=nrev_nocrewmt)) +
+  geom_boxplot(outlier.shape = NA) + 
+      stat_summary(fun.y=mean, geom="point", shape=20, size=2, color="red", fill="red") +
+  theme_minimal() +
+  labs(x="Year", y="$/MT", title="Per MT") + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) + rremove("legend.title") +
+coord_flip(ylim=c(1000,6500))
+#c
+
+d <- ggarrange(a+theme(plot.margin=margin(r=1,l=1)),
+               b+theme(axis.text.y= element_blank(),
+                                   axis.ticks.y=element_blank(),
+                                   axis.title.y=element_blank(),
+                                   #axis.title.x=element_blank(),
+                                     plot.margin=margin(r=1,l=1)),
+               c+theme(axis.text.y= element_blank(),
+                                   axis.ticks.y=element_blank(),
+                                   axis.title.y=element_blank(),
+                                   #axis.title.x=element_blank(),
+                                     plot.margin=margin(r=1,l=1)),
+               nrow=1, ncol = 3, align = "h", widths = c(1.2,1,1))
+
+d
+
+```
+
+# Figure S8
+
+```{r}
+axescolor <- c("gray","gray","gray","gray","black","black","black","black","black","black","black","black","black","black","black","black")
+
+#Net revenue: before lease and crew costs
+a <- remun_bbrbss %>% filter(fishery_code=="BSS") %>% ggplot(aes(x=factor(year), y=nrev_nocrew/revmt)) + 
+  geom_boxplot(outlier.shape = NA) + 
+    stat_summary(fun.y=mean, geom="point", shape=20, size=2, color="red", fill="red") +
+  theme_minimal() +
+  labs(x="Year", y="MT", title="Season") + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) + 
+  theme(axis.text.y = element_text(color = axescolor)) +
+  rremove("legend.title") + coord_flip(ylim=c(0,850))
+
+#a
+
+#Per day
+b <- remun_bbrbss %>% filter(fishery_code=="BSS") %>% ggplot(aes(x=factor(year), y=nrev_nocrew/(tripd*revmt))) +
+  geom_boxplot(outlier.shape = NA) + 
+      stat_summary(fun.y=mean, geom="point", shape=20, size=2, color="red", fill="red") +
+  theme_minimal() +
+  labs(x="Year", y="MT/day", title = "Per day") + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) + 
+  rremove("legend.title") + coord_flip(ylim=c(0,15))
+
+#b
+
+#Per MT
+
+c <- remun_bbrbss %>% filter(fishery_code=="BSS") %>% ggplot(aes(x=factor(year), y=nrev_nocrewmt/revmt)) +
+  geom_boxplot(outlier.shape = NA) + 
+      stat_summary(fun.y=mean, geom="point", shape=20, size=2, color="red", fill="red") +
+  theme_minimal() +
+  labs(x="Year", y="MT/MT", title="Per MT") + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) + rremove("legend.title") +
+coord_flip(ylim=c(0.5,1))
+#c
+
+d <- ggarrange(a+theme(plot.margin=margin(r=1,l=1)),
+               b+theme(axis.text.y= element_blank(),
+                                   axis.ticks.y=element_blank(),
+                                   axis.title.y=element_blank(),
+                                   #axis.title.x=element_blank(),
+                                     plot.margin=margin(r=1,l=1)),
+               c+theme(axis.text.y= element_blank(),
+                                   axis.ticks.y=element_blank(),
+                                   axis.title.y=element_blank(),
+                                   #axis.title.x=element_blank(),
+                                     plot.margin=margin(r=1,l=1)),
+               nrow=1, ncol = 3, align = "h", widths = c(1.2,1,1))
+
+d
+
+```
+
+
+# Figure 2 and S9
+
+```{r}
+collapse <- remun_bbrbss %>% select(year,crewcost,captcost, nrev_nocrew, qscost,cost_nocrew, exvrev, fishery_code) %>% group_by(year,fishery_code) %>% summarise(
+  crew = sum(crewcost, na.rm = TRUE),
+  captain = sum(captcost, na.rm = TRUE),
+  nrev_nocrew = sum(nrev_nocrew, na.rm = TRUE),
+  lease = sum(qscost, na.rm = TRUE),
+  inputs = sum(cost_nocrew, na.rm = TRUE),
+  exvrev = sum(exvrev, na.rm = TRUE)
+) %>% mutate(worker = crew+captain,
+             owner = nrev_nocrew - worker - lease)
+
+#Move claimants from variables to rows. 
+collapse <- collapse %>% gather(crew, captain, nrev_nocrew, lease, inputs, exvrev, worker, owner, key="claimant", value="payment") %>% arrange(year, fishery_code, claimant) 
+
+
+axescolor.bbr <- c("gray","gray","gray","black","black","black","black","black","black","black","black","black","black","black","black","black")
+axescolor.bss <- c("gray","gray","gray","gray","black","black","black","black","black","black","black","black","black","black","black","black")
+
+collapse2 <- collapse %>% filter(claimant %in% c("lease","owner","crew","captain"))
+
+collapse2 <- collapse2 %>% group_by(year, fishery_code) %>% mutate(percentage = payment/sum(payment))
+
+collapse2 <- collapse2 %>% mutate(claimant = factor(claimant,levels=c("owner","lease","captain", "crew"))) %>% mutate(claimant.v2 = case_when(
+  claimant=="owner" ~ "Vessel owner",
+  claimant=="lease" ~ "Quota lessor",
+  claimant=="captain" ~ "Captains",
+  claimant=="crew" ~ "Crew"
+)) %>% 
+   mutate(claimant.v2 = factor(claimant.v2,levels=c("Vessel owner","Quota lessor","Captains", "Crew")))
+
+
+a <- collapse2 %>% filter(fishery_code=="BBR") %>% 
+ggplot(aes(x=year, y=percentage, fill=claimant.v2)) + 
+    geom_area(alpha=0.6 , size=.75, colour="black") + theme_light() + scale_x_continuous(breaks=c(1998,2001,2004,2005, 2006, 2007, 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017), expand=c(0,0)) + theme(axis.text.x = element_text(angle = 90, hjust = 1, color = axescolor.bbr),panel.grid.minor = element_blank()) + labs(x="Year", y="Share") + rremove("legend.title") + scale_y_continuous(expand=c(0,0))
+
+a
+
+b <- collapse2 %>% filter(fishery_code=="BSS") %>% 
+ggplot(aes(x=year, y=percentage, fill=claimant.v2)) + 
+    geom_area(alpha=0.6 , size=.75, colour="black") + theme_light() + scale_x_continuous(breaks=c(1998,2001,2004,2005, 2006, 2007, 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017), expand=c(0,0)) + theme(axis.text.x = element_text(angle = 90, hjust = 1, color = axescolor.bss),panel.grid.minor = element_blank()) + labs(x="Year", y="Share") + rremove("legend.title") + scale_y_continuous(expand=c(0,0))
+
+b
+
+```
+
+# Figure 3 and S11
+
+If nfdays==TRUE then this makes Figures S25 and S26 also.  
+
+```{r quant_wage, echo=FALSE}
+
+
+axescolor.bbr <- c("gray","gray","gray","black","black","black","black","black","black","black","black","black","black","black","black","black")
+
+axescolor.bss <- c("gray","gray","gray","gray","black","black","black","black","black","black","black","black","black","black","black","black")
+
+lsize <- c(1,0.5,0.5,0.5,0.5,0.5)
+lltype <- c(1,3,3,3,3,3)
+psize <- c(1,0,0,0,0,0)
+
+#Quantile regression
+
+#BBR crew
+depvar <- "crewwage"
+form <- as.formula(paste0(depvar,"~", "factor(year)-1"))
+a <- rq(form, tau=c(.1,.25,.5,.75,.9), data=remun_bbr, weights=crewcount, model=TRUE)
+b <- summary(a)
+q10 <- b[[1]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q10", year=c(1998,2001,2004:2017))
+q25 <- b[[2]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q25", year=c(1998,2001,2004:2017))
+q50 <- b[[3]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q50", year=c(1998,2001,2004:2017))
+q75 <- b[[4]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q75", year=c(1998,2001,2004:2017))
+q90 <- b[[5]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q90", year=c(1998,2001,2004:2017))
+
+mean <- remun_bbr %>% group_by(year) %>% summarise(x=weighted.mean(crewwage,crewcount)) %>% mutate(quantile="mean")
+
+c <- rbind(q10,q25,q50,q75,q90,mean)
+
+
+crew.bbr <- c %>%
+  ggplot(aes(x=year, y=x, color=quantile, linetype=quantile)) +
+  geom_line(aes(size=quantile)) +
+  geom_point(aes(size=quantile)) + 
+  theme_light() +
+  labs(y="$/day", title="Crew", x="") +
+   rremove("legend.title") +
+  theme(panel.grid.minor = element_blank()) +
+  scale_x_continuous(breaks=c(1998,2001,2004,2005, 2006, 2007, 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017)) +
+  scale_size_manual(name="quantile", values=lsize) +
+  scale_linetype_manual(name="quantile",values=lltype) +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1), legend.position = "bottom") 
+#crew.bbr
+
+#BBR captains
+depvar <- "captwage"
+form <- as.formula(paste0(depvar,"~", "factor(year)-1"))
+a <- rq(form, tau=c(.1,.25,.5,.75,.9), data=remun_bbr, model=TRUE)
+b <- summary(a)
+q10 <- b[[1]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q10", year=c(1998,2001,2004:2017))
+q25 <- b[[2]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q25", year=c(1998,2001,2004:2017))
+q50 <- b[[3]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q50", year=c(1998,2001,2004:2017))
+q75 <- b[[4]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q75", year=c(1998,2001,2004:2017))
+q90 <- b[[5]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q90", year=c(1998,2001,2004:2017))
+
+mean <- remun_bbr %>% group_by(year) %>% summarise(x=mean(captwage)) %>% mutate(quantile="mean")
+
+c <- rbind(q10,q25,q50,q75,q90,mean)
+
+
+capt.bbr <- c %>%
+  ggplot(aes(x=year, y=x, color=quantile, linetype=quantile)) +
+  geom_line(aes(size=quantile)) +
+  geom_point(aes(size=quantile)) + 
+  theme_light() +
+  labs(y="$/day", title="Captains", x="") +
+   rremove("legend.title") +
+  theme(panel.grid.minor = element_blank()) +
+  scale_x_continuous(breaks=c(1998,2001,2004,2005, 2006, 2007, 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017)) +
+  scale_size_manual(name="quantile", values=lsize) +
+  scale_linetype_manual(name="quantile",values=lltype) +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1), legend.position = "bottom") 
+#capt.bbr
+
+
+#BBR owners
+depvar <- "ownerreturn_wage"
+form <- as.formula(paste0(depvar,"~", "factor(year)-1"))
+a <- rq(form, tau=c(.1,.25,.5,.75,.9), data=remun_bbr, model=TRUE)
+b <- summary(a)
+q10 <- b[[1]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q10", year=c(1998,2001,2004:2017))
+q25 <- b[[2]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q25", year=c(1998,2001,2004:2017))
+q50 <- b[[3]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q50", year=c(1998,2001,2004:2017))
+q75 <- b[[4]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q75", year=c(1998,2001,2004:2017))
+q90 <- b[[5]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q90", year=c(1998,2001,2004:2017))
+
+
+mean <- remun_bbr %>% group_by(year) %>% summarise(x=mean(ownerreturn_wage)) %>% mutate(quantile="mean")
+
+c <- rbind(q10,q25,q50,q75,q90,mean)
+
+owner.bbr <- c %>%
+  ggplot(aes(x=year, y=x, color=quantile, linetype=quantile)) +
+  geom_line(aes(size=quantile)) +
+  geom_point(aes(size=quantile)) + 
+  theme_light() +
+  labs(y="$/day", title="Vessel owners", x="") +
+   rremove("legend.title") +
+  theme(panel.grid.minor = element_blank()) +
+  scale_x_continuous(breaks=c(1998,2001,2004,2005, 2006, 2007, 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017)) +
+  scale_size_manual(name="quantile", values=lsize) +
+  scale_linetype_manual(name="quantile",values=lltype) +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1), legend.position = "bottom") 
+  
+#owner.bbr
+
+
+#BBR capital
+depvar <- "capitalreturn_wage"
+form <- as.formula(paste0(depvar,"~", "factor(year)-1"))
+a <- rq(form, tau=c(.1,.25,.5,.75,.9), data=remun_bbr, model=TRUE)
+b <- summary(a)
+q10 <- b[[1]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q10", year=c(1998,2001,2004:2017))
+q25 <- b[[2]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q25", year=c(1998,2001,2004:2017))
+q50 <- b[[3]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q50", year=c(1998,2001,2004:2017))
+q75 <- b[[4]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q75", year=c(1998,2001,2004:2017))
+q90 <- b[[5]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q90", year=c(1998,2001,2004:2017))
+
+mean <- remun_bbr %>% group_by(year) %>% summarise(x=mean(capitalreturn_wage)) %>% mutate(quantile="mean")
+
+c <- rbind(q10,q25,q50,q75,q90,mean)
+
+capital.bbr <- c %>%
+  ggplot(aes(x=year, y=x, color=quantile, linetype=quantile)) +
+  geom_line(aes(size=quantile)) +
+  geom_point(aes(size=quantile)) + 
+  theme_light() +
+  labs(y="$/day", title="Vessel owners & quota lessors", x="") +
+   rremove("legend.title") +
+  theme(panel.grid.minor = element_blank(),
+        axis.text.x = element_text(color = axescolor.bbr)) +
+  scale_x_continuous(breaks=c(1998,2001,2004,2005, 2006, 2007, 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017)) +
+  scale_size_manual(name="quantile", values=lsize) +
+  scale_linetype_manual(name="quantile",values=lltype) +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1), legend.position = "bottom") 
+  
+#capital.bbr
+
+#################
+
+#BSS crew
+depvar <- "crewwage"
+form <- as.formula(paste0(depvar,"~", "factor(year)-1"))
+a <- rq(form, tau=c(.1,.25,.5,.75,.9), data=remun_bss, weights=crewcount, model=TRUE)
+b <- summary(a)
+q10 <- b[[1]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q10", year=c(1998,2001,2004:2017))
+q25 <- b[[2]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q25",year=c(1998,2001,2004:2017))
+q50 <- b[[3]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q50",year=c(1998,2001,2004:2017))
+q75 <- b[[4]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q75",year=c(1998,2001,2004:2017))
+q90 <- b[[5]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q90",year=c(1998,2001,2004:2017))
+
+mean <- remun_bss %>% group_by(year) %>% summarise(x=weighted.mean(crewwage,crewcount)) %>% mutate(quantile="mean")
+
+c <- rbind(q10,q25,q50,q75,q90,mean)
+
+crew.bss <- c %>% 
+  ggplot(aes(x=year, y=x, color=quantile, linetype=quantile)) +
+  geom_line(aes(size=quantile)) +
+  geom_point(aes(size=quantile)) + 
+  theme_light() +
+  labs(y="$/day", title="Crew", x="") +
+   rremove("legend.title") +
+  theme(panel.grid.minor = element_blank(),
+        axis.text.x = element_text(color = axescolor.bss)) +
+  scale_x_continuous(breaks=c(1998,2001,2004,2005, 2006, 2007, 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017)) +
+    scale_size_manual(name="quantile", values=lsize) +
+  scale_linetype_manual(name="quantile",values=lltype) +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1), legend.position = "bottom")
+#crew.bss
+
+
+#BSS captains
+depvar <- "captwage"
+form <- as.formula(paste0(depvar,"~", "factor(year)-1"))
+a <- rq(form, tau=c(.1,.25,.5,.75,.9), data=remun_bss, model=TRUE)
+b <- summary(a)
+q10 <- b[[1]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q10", year=c(1998,2001,2004:2017))
+q25 <- b[[2]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q25", year=c(1998,2001,2004:2017))
+q50 <- b[[3]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q50", year=c(1998,2001,2004:2017))
+q75 <- b[[4]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q75", year=c(1998,2001,2004:2017))
+q90 <- b[[5]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q90", year=c(1998,2001,2004:2017))
+
+mean <- remun_bss %>% group_by(year) %>% summarise(x=mean(captwage)) %>% mutate(quantile="mean")
+
+c <- rbind(q10,q25,q50,q75,q90,mean)
+
+
+capt.bss <- c %>%
+  ggplot(aes(x=year, y=x, color=quantile, linetype=quantile)) +
+  geom_line(aes(size=quantile)) +
+  geom_point(aes(size=quantile)) + 
+  theme_light() +
+  labs(y="$/day", title="Captains", x="") +
+   rremove("legend.title") +
+  theme(panel.grid.minor = element_blank()) +
+  scale_x_continuous(breaks=c(1998,2001,2004,2005, 2006, 2007, 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017)) +
+    scale_size_manual(name="quantile", values=lsize) +
+  scale_linetype_manual(name="quantile",values=lltype) +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1), legend.position = "bottom")
+#capt.bss
+
+
+#BSS owners
+depvar <- "ownerreturn_wage"
+form <- as.formula(paste0(depvar,"~", "factor(year)-1"))
+a <- rq(form, tau=c(.1,.25,.5,.75,.9), data=remun_bss, model=TRUE)
+b <- summary(a)
+q10 <- b[[1]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q10", year=c(1998,2001,2004:2017))
+q25 <- b[[2]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q25", year=c(1998,2001,2004:2017))
+q50 <- b[[3]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q50", year=c(1998,2001,2004:2017))
+q75 <- b[[4]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q75", year=c(1998,2001,2004:2017))
+q90 <- b[[5]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q90", year=c(1998,2001,2004:2017))
+
+mean <- remun_bss %>% group_by(year) %>% summarise(x=mean(ownerreturn_wage)) %>% mutate(quantile="mean")
+
+c <- rbind(q10,q25,q50,q75,q90,mean)
+
+owner.bss <- c %>%
+  ggplot(aes(x=year, y=x, color=quantile, linetype=quantile)) +
+  geom_line(aes(size=quantile)) +
+  geom_point(aes(size=quantile)) + 
+  theme_light() +
+  labs(y="$/day", title="Vessel owners", x="") +
+   rremove("legend.title") +
+  theme(panel.grid.minor = element_blank()) +
+  scale_x_continuous(breaks=c(1998,2001,2004,2005, 2006, 2007, 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017)) +
+    scale_size_manual(name="quantile", values=lsize) +
+  scale_linetype_manual(name="quantile",values=lltype) +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1), legend.position = "bottom")
+#owner.bss
+
+
+#BSS capital
+depvar <- "capitalreturn_wage"
+form <- as.formula(paste0(depvar,"~", "factor(year)-1"))
+a <- rq(form, tau=c(.1,.25,.5,.75,.9), data=remun_bss, model=TRUE)
+b <- summary(a)
+q10 <- b[[1]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q10", year=c(1998,2001,2004:2017))
+q25 <- b[[2]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q25", year=c(1998,2001,2004:2017))
+q50 <- b[[3]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q50", year=c(1998,2001,2004:2017))
+q75 <- b[[4]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q75", year=c(1998,2001,2004:2017))
+q90 <- b[[5]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q90", year=c(1998,2001,2004:2017))
+
+mean <- remun_bss %>% group_by(year) %>% summarise(x=mean(capitalreturn_wage)) %>% mutate(quantile="mean")
+
+c <- rbind(q10,q25,q50,q75,q90,mean)
+
+capital.bss <- c %>%
+  ggplot(aes(x=year, y=x, color=quantile, linetype=quantile)) +
+  geom_line(aes(size=quantile)) +
+  geom_point(aes(size=quantile)) + 
+  theme_light() +
+  labs(y="$/day", title="Vessel owners & quota lessors", x="") +
+   rremove("legend.title") +
+  theme(panel.grid.minor = element_blank(), 
+        axis.text.x = element_text(color = axescolor.bss)) +
+  scale_x_continuous(breaks=c(1998,2001,2004,2005, 2006, 2007, 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017)) +
+    scale_size_manual(name="quantile", values=lsize) +
+  scale_linetype_manual(name="quantile",values=lltype) +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1), legend.position = "bottom")
+#capital.bss
+
+
+
+##Composite figures
+
+quant.return.bbr <- ggarrange(crew.bbr+theme(axis.text.x = element_blank(),
+                     axis.ticks.x = element_blank(),
+                     axis.title.x = element_blank(), 
+                     plot.margin=margin(t=0,b=0)), 
+                     capt.bbr+theme(axis.text.x = element_blank(),
+                     axis.ticks.x = element_blank(),
+                     axis.title.x = element_blank(),
+                     plot.margin=margin(t=0,b=0)),
+                     owner.bbr+theme(axis.text.x = element_blank(),
+                     axis.ticks.x = element_blank(),
+                     axis.title.x = element_blank(),
+                     plot.margin=margin(t=0,b=0)),
+                     capital.bbr, nrow = 4, ncol=1, common.legend = TRUE, legend="bottom", heights=c(1,1,1,1.75), align="v")
+quant.return.bbr
+  
+
+
+quant.return.bss <- ggarrange(crew.bss+theme(axis.text.x = element_blank(),
+                     axis.ticks.x = element_blank(),
+                     axis.title.x = element_blank(), 
+                     plot.margin=margin(t=0,b=0)), 
+                     capt.bss+theme(axis.text.x = element_blank(),
+                     axis.ticks.x = element_blank(),
+                     axis.title.x = element_blank(),
+                     plot.margin=margin(t=0,b=0)),
+                     owner.bss+theme(axis.text.x = element_blank(),
+                     axis.ticks.x = element_blank(),
+                     axis.title.x = element_blank(),
+                     plot.margin=margin(t=0,b=0)),
+                     capital.bss, nrow = 4, ncol=1, common.legend = TRUE, legend="bottom", heights=c(1,1,1,1.75), align="v")
+quant.return.bss
+
+```
+
+#Figure S10 and S12
+
+```{r quant_wage_CE, echo=FALSE}
+
+axescolor.bbr <- c("gray","gray","gray","black","black","black","black","black","black","black","black","black","black","black","black","black")
+
+axescolor.bss <- c("gray","gray","gray","gray","black","black","black","black","black","black","black","black","black","black","black","black")
+
+lsize <- c(1,0.5,0.5,0.5,0.5,0.5)
+lltype <- c(1,3,3,3,3,3)
+psize <- c(1,0,0,0,0,0)
+
+#Quantile regression
+
+#BBR crew
+depvar <- "crewwage/revmt"
+form <- as.formula(paste0(depvar,"~", "factor(year)-1"))
+a <- rq(form, tau=c(.1,.25,.5,.75,.9), data=remun_bbr, weights=crewcount, model=TRUE)
+b <- summary(a)
+q10 <- b[[1]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q10", year=c(1998,2001,2004:2017))
+q25 <- b[[2]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q25", year=c(1998,2001,2004:2017))
+q50 <- b[[3]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q50", year=c(1998,2001,2004:2017))
+q75 <- b[[4]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q75", year=c(1998,2001,2004:2017))
+q90 <- b[[5]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q90", year=c(1998,2001,2004:2017))
+
+mean <- remun_bbr %>% group_by(year) %>% summarise(x=weighted.mean(crewwage/revmt,crewcount)) %>% mutate(quantile="mean")
+
+c <- rbind(q10,q25,q50,q75,q90,mean)
+
+
+crew.bbr <- c %>%
+  ggplot(aes(x=year, y=x, color=quantile, linetype=quantile)) +
+  geom_line(aes(size=quantile)) +
+  geom_point(aes(size=quantile)) + 
+  theme_light() +
+  labs(y="MT/day", title="Crew", x="") +
+   rremove("legend.title") +
+  theme(panel.grid.minor = element_blank()) +
+  scale_x_continuous(breaks=c(1998,2001,2004,2005, 2006, 2007, 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017)) +
+  scale_size_manual(name="quantile", values=lsize) +
+  scale_linetype_manual(name="quantile",values=lltype)
+    theme(axis.text.x = element_text(angle = 90, hjust = 1), legend.position = "bottom") 
+#crew.bbr
+
+#BBR captains
+depvar <- "captwage/revmt"
+form <- as.formula(paste0(depvar,"~", "factor(year)-1"))
+a <- rq(form, tau=c(.1,.25,.5,.75,.9), data=remun_bbr, model=TRUE)
+b <- summary(a)
+q10 <- b[[1]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q10", year=c(1998,2001,2004:2017))
+q25 <- b[[2]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q25", year=c(1998,2001,2004:2017))
+q50 <- b[[3]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q50", year=c(1998,2001,2004:2017))
+q75 <- b[[4]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q75", year=c(1998,2001,2004:2017))
+q90 <- b[[5]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q90", year=c(1998,2001,2004:2017))
+
+mean <- remun_bbr %>% group_by(year) %>% summarise(x=mean(captwage/revmt)) %>% mutate(quantile="mean")
+
+c <- rbind(q10,q25,q50,q75,q90,mean)
+
+
+capt.bbr <- c %>%
+  ggplot(aes(x=year, y=x, color=quantile, linetype=quantile)) +
+  geom_line(aes(size=quantile)) +
+  geom_point(aes(size=quantile)) + 
+  theme_light() +
+  labs(y="MT/day", title="Captains", x="") +
+   rremove("legend.title") +
+  theme(panel.grid.minor = element_blank()) +
+  scale_x_continuous(breaks=c(1998,2001,2004,2005, 2006, 2007, 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017)) +
+  scale_size_manual(name="quantile", values=lsize) +
+  scale_linetype_manual(name="quantile",values=lltype) +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1), legend.position = "bottom") 
+#capt.bbr
+
+
+#BBR owners
+depvar <- "ownerreturn_wage/revmt"
+form <- as.formula(paste0(depvar,"~", "factor(year)-1"))
+a <- rq(form, tau=c(.1,.25,.5,.75,.9), data=remun_bbr, model=TRUE)
+b <- summary(a)
+q10 <- b[[1]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q10", year=c(1998,2001,2004:2017))
+q25 <- b[[2]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q25", year=c(1998,2001,2004:2017))
+q50 <- b[[3]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q50", year=c(1998,2001,2004:2017))
+q75 <- b[[4]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q75", year=c(1998,2001,2004:2017))
+q90 <- b[[5]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q90", year=c(1998,2001,2004:2017))
+
+
+mean <- remun_bbr %>% group_by(year) %>% summarise(x=mean(ownerreturn_wage/revmt)) %>% mutate(quantile="mean")
+
+c <- rbind(q10,q25,q50,q75,q90,mean)
+
+owner.bbr <- c %>%
+  ggplot(aes(x=year, y=x, color=quantile, linetype=quantile)) +
+  geom_line(aes(size=quantile)) +
+  geom_point(aes(size=quantile)) + 
+  theme_light() +
+  labs(y="MT/day", title="Vessel owners", x="") +
+   rremove("legend.title") +
+  theme(panel.grid.minor = element_blank()) +
+  scale_x_continuous(breaks=c(1998,2001,2004,2005, 2006, 2007, 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017)) +
+  scale_size_manual(name="quantile", values=lsize) +
+  scale_linetype_manual(name="quantile",values=lltype) +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1), legend.position = "bottom") 
+  
+#owner.bbr
+
+
+#BBR capital
+depvar <- "capitalreturn_wage/revmt"
+form <- as.formula(paste0(depvar,"~", "factor(year)-1"))
+a <- rq(form, tau=c(.1,.25,.5,.75,.9), data=remun_bbr, model=TRUE)
+b <- summary(a)
+q10 <- b[[1]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q10", year=c(1998,2001,2004:2017))
+q25 <- b[[2]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q25", year=c(1998,2001,2004:2017))
+q50 <- b[[3]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q50", year=c(1998,2001,2004:2017))
+q75 <- b[[4]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q75", year=c(1998,2001,2004:2017))
+q90 <- b[[5]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q90", year=c(1998,2001,2004:2017))
+
+mean <- remun_bbr %>% group_by(year) %>% summarise(x=mean(capitalreturn_wage/revmt)) %>% mutate(quantile="mean")
+
+c <- rbind(q10,q25,q50,q75,q90,mean)
+
+capital.bbr <- c %>%
+  ggplot(aes(x=year, y=x, color=quantile, linetype=quantile)) +
+  geom_line(aes(size=quantile)) +
+  geom_point(aes(size=quantile)) + 
+  theme_light() +
+  labs(y="MT/day", title="Vessel owners & quota lessors", x="") +
+   rremove("legend.title") +
+  theme(panel.grid.minor = element_blank(),
+        axis.text.x = element_text(color = axescolor.bbr)) +
+  scale_x_continuous(breaks=c(1998,2001,2004,2005, 2006, 2007, 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017)) +
+  scale_size_manual(name="quantile", values=lsize) +
+  scale_linetype_manual(name="quantile",values=lltype) +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1), legend.position = "bottom") 
+  
+#capital.bbr
+
+#################
+
+#BSS crew
+depvar <- "crewwage/revmt"
+form <- as.formula(paste0(depvar,"~", "factor(year)-1"))
+a <- rq(form, tau=c(.1,.25,.5,.75,.9), data=remun_bss, weights=crewcount, model=TRUE)
+b <- summary(a)
+q10 <- b[[1]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q10", year=c(1998,2001,2004:2017))
+q25 <- b[[2]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q25",year=c(1998,2001,2004:2017))
+q50 <- b[[3]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q50",year=c(1998,2001,2004:2017))
+q75 <- b[[4]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q75",year=c(1998,2001,2004:2017))
+q90 <- b[[5]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q90",year=c(1998,2001,2004:2017))
+
+mean <- remun_bss %>% group_by(year) %>% summarise(x=weighted.mean(crewwage/revmt,crewcount)) %>% mutate(quantile="mean")
+
+c <- rbind(q10,q25,q50,q75,q90,mean)
+
+crew.bss <- c %>% 
+  ggplot(aes(x=year, y=x, color=quantile, linetype=quantile)) +
+  geom_line(aes(size=quantile)) +
+  geom_point(aes(size=quantile)) + 
+  theme_light() +
+  labs(y="MT/day", title="Crew", x="") +
+   rremove("legend.title") +
+  theme(panel.grid.minor = element_blank(),
+        axis.text.x = element_text(color = axescolor.bss)) +
+  scale_x_continuous(breaks=c(1998,2001,2004,2005, 2006, 2007, 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017)) +
+    scale_size_manual(name="quantile", values=lsize) +
+  scale_linetype_manual(name="quantile",values=lltype) +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1), legend.position = "bottom")
+#crew.bss
+
+
+#BSS captains
+depvar <- "captwage/revmt"
+form <- as.formula(paste0(depvar,"~", "factor(year)-1"))
+a <- rq(form, tau=c(.1,.25,.5,.75,.9), data=remun_bss, model=TRUE)
+b <- summary(a)
+q10 <- b[[1]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q10", year=c(1998,2001,2004:2017))
+q25 <- b[[2]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q25", year=c(1998,2001,2004:2017))
+q50 <- b[[3]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q50", year=c(1998,2001,2004:2017))
+q75 <- b[[4]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q75", year=c(1998,2001,2004:2017))
+q90 <- b[[5]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q90", year=c(1998,2001,2004:2017))
+
+mean <- remun_bss %>% group_by(year) %>% summarise(x=mean(captwage/revmt)) %>% mutate(quantile="mean")
+
+c <- rbind(q10,q25,q50,q75,q90,mean)
+
+
+capt.bss <- c %>%
+  ggplot(aes(x=year, y=x, color=quantile, linetype=quantile)) +
+  geom_line(aes(size=quantile)) +
+  geom_point(aes(size=quantile)) + 
+  theme_light() +
+  labs(y="MT/day", title="Captains", x="") +
+   rremove("legend.title") +
+  theme(panel.grid.minor = element_blank()) +
+  scale_x_continuous(breaks=c(1998,2001,2004,2005, 2006, 2007, 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017)) +
+    scale_size_manual(name="quantile", values=lsize) +
+  scale_linetype_manual(name="quantile",values=lltype) +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1), legend.position = "bottom")
+#capt.bss
+
+
+#BSS owners
+depvar <- "ownerreturn_wage/revmt"
+form <- as.formula(paste0(depvar,"~", "factor(year)-1"))
+a <- rq(form, tau=c(.1,.25,.5,.75,.9), data=remun_bss, model=TRUE)
+b <- summary(a)
+q10 <- b[[1]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q10", year=c(1998,2001,2004:2017))
+q25 <- b[[2]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q25", year=c(1998,2001,2004:2017))
+q50 <- b[[3]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q50", year=c(1998,2001,2004:2017))
+q75 <- b[[4]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q75", year=c(1998,2001,2004:2017))
+q90 <- b[[5]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q90", year=c(1998,2001,2004:2017))
+
+mean <- remun_bss %>% group_by(year) %>% summarise(x=mean(ownerreturn_wage/revmt)) %>% mutate(quantile="mean")
+
+c <- rbind(q10,q25,q50,q75,q90,mean)
+
+owner.bss <- c %>%
+  ggplot(aes(x=year, y=x, color=quantile, linetype=quantile)) +
+  geom_line(aes(size=quantile)) +
+  geom_point(aes(size=quantile)) + 
+  theme_light() +
+  labs(y="MT/day", title="Vessel owners", x="") +
+   rremove("legend.title") +
+  theme(panel.grid.minor = element_blank()) +
+  scale_x_continuous(breaks=c(1998,2001,2004,2005, 2006, 2007, 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017)) +
+    scale_size_manual(name="quantile", values=lsize) +
+  scale_linetype_manual(name="quantile",values=lltype) +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1), legend.position = "bottom")
+#owner.bss
+
+
+#BSS capital
+depvar <- "capitalreturn_wage/revmt"
+form <- as.formula(paste0(depvar,"~", "factor(year)-1"))
+a <- rq(form, tau=c(.1,.25,.5,.75,.9), data=remun_bss, model=TRUE)
+b <- summary(a)
+q10 <- b[[1]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q10", year=c(1998,2001,2004:2017))
+q25 <- b[[2]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q25", year=c(1998,2001,2004:2017))
+q50 <- b[[3]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q50", year=c(1998,2001,2004:2017))
+q75 <- b[[4]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q75", year=c(1998,2001,2004:2017))
+q90 <- b[[5]]$coefficients[1:16] %>% tidy() %>% mutate(quantile="q90", year=c(1998,2001,2004:2017))
+
+mean <- remun_bss %>% group_by(year) %>% summarise(x=mean(capitalreturn_wage/revmt)) %>% mutate(quantile="mean")
+
+c <- rbind(q10,q25,q50,q75,q90,mean)
+
+capital.bss <- c %>%
+  ggplot(aes(x=year, y=x, color=quantile, linetype=quantile)) +
+  geom_line(aes(size=quantile)) +
+  geom_point(aes(size=quantile)) + 
+  theme_light() +
+  labs(y="MT/day", title="Vessel owners & quota lessors", x="") +
+   rremove("legend.title") +
+  theme(panel.grid.minor = element_blank(), 
+        axis.text.x = element_text(color = axescolor.bss)) +
+  scale_x_continuous(breaks=c(1998,2001,2004,2005, 2006, 2007, 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017)) +
+    scale_size_manual(name="quantile", values=lsize) +
+  scale_linetype_manual(name="quantile",values=lltype) +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1), legend.position = "bottom")
+#capital.bss
+
+
+
+##Composite figures
+
+quant.return.bbr <- ggarrange(crew.bbr+theme(axis.text.x = element_blank(),
+                     axis.ticks.x = element_blank(),
+                     axis.title.x = element_blank(), 
+                     plot.margin=margin(t=0,b=0)), 
+                     capt.bbr+theme(axis.text.x = element_blank(),
+                     axis.ticks.x = element_blank(),
+                     axis.title.x = element_blank(),
+                     plot.margin=margin(t=0,b=0)),
+                     owner.bbr+theme(axis.text.x = element_blank(),
+                     axis.ticks.x = element_blank(),
+                     axis.title.x = element_blank(),
+                     plot.margin=margin(t=0,b=0)),
+                     capital.bbr, nrow = 4, ncol=1, common.legend = TRUE, legend="bottom", heights=c(1,1,1,1.75), align="v")
+quant.return.bbr
+
+quant.return.bss <- ggarrange(crew.bss+theme(axis.text.x = element_blank(),
+                     axis.ticks.x = element_blank(),
+                     axis.title.x = element_blank(), 
+                     plot.margin=margin(t=0,b=0)), 
+                     capt.bss+theme(axis.text.x = element_blank(),
+                     axis.ticks.x = element_blank(),
+                     axis.title.x = element_blank(),
+                     plot.margin=margin(t=0,b=0)),
+                     owner.bss+theme(axis.text.x = element_blank(),
+                     axis.ticks.x = element_blank(),
+                     axis.title.x = element_blank(),
+                     plot.margin=margin(t=0,b=0)),
+                     capital.bss, nrow = 4, ncol=1, common.legend = TRUE, legend="bottom", heights=c(1,1,1,1.75), align="v")
+quant.return.bss
+
+```
+
+# Figure S13 & S14
+
+If nfdays==TRUE then this makes S27 and S28 also. 
+
+```{r}
+#BBR
+temp <- remun_bbrbss %>% filter(postCR=="AFTER") %>% group_by(year, fishery_code) %>% summarise(crewwage_gtbefore=weighted.mean(crewwage_gtbefore,w=crewcount,na.rm=TRUE), captwage_gtbefore=mean(captwage_gtbefore, na.rm = TRUE), ownerreturn_gtbefore = mean(ownerreturn_gtbefore,na.rm=TRUE), capitalreturn_gtbefore=mean(capitalreturn_gtbefore,na.rm=TRUE))
+  
+a <- temp %>% filter(fishery_code=="BBR") %>% ggplot(aes(x=year)) +
+  geom_line(aes(y=crewwage_gtbefore, color="Crew", linetype="Crew")) +
+  geom_point(aes(y=crewwage_gtbefore, color="Crew")) +
+  geom_line(aes(y=captwage_gtbefore, color="Captain", linetype="Captain")) +
+  geom_point(aes(y=captwage_gtbefore, color="Captain")) +
+  geom_line(aes(y=ownerreturn_gtbefore, color="Vessel owners", linetype="Vessel owners")) +
+  geom_point(aes(y=ownerreturn_gtbefore, color="Vessel owners")) +
+  geom_line(aes(y=capitalreturn_gtbefore, color="Vessel owners & quota lessors", linetype="Vessel owners & quota lessors")) +
+  geom_point(aes(y=capitalreturn_gtbefore, color="Vessel owners & quota lessors")) +
+theme_light() + labs(x="Year", y="Fraction") + coord_cartesian(ylim = c(0,1)) +  rremove("legend.title") + scale_linetype(name="type") +
+  scale_x_continuous(breaks=c(2005, 2006, 2007, 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017)) +
+   theme(axis.text.x = element_text(angle = 45, hjust = 1), panel.grid.minor = element_blank()) +
+  scale_color_discrete(name="type") + theme(legend.position = "bottom") +
+guides(linetype=guide_legend(nrow=2,byrow=TRUE))
+a
+
+#BSS
+
+
+b <- temp %>% filter(fishery_code=="BSS") %>% ggplot(aes(x=year)) +
+  geom_line(aes(y=crewwage_gtbefore, color="Crew", linetype="Crew")) +
+  geom_point(aes(y=crewwage_gtbefore, color="Crew")) +
+  geom_line(aes(y=captwage_gtbefore, color="Captain", linetype="Captain")) +
+  geom_point(aes(y=captwage_gtbefore, color="Captain")) +
+  geom_line(aes(y=ownerreturn_gtbefore, color="Vessel owners", linetype="Vessel owners")) +
+  geom_point(aes(y=ownerreturn_gtbefore, color="Vessel owners")) +
+  geom_line(aes(y=capitalreturn_gtbefore, color="Vessel owners & quota lessors", linetype="Vessel owners & quota lessors")) +
+  geom_point(aes(y=capitalreturn_gtbefore, color="Vessel owners & quota lessors")) +
+theme_light() + labs(x="Year", y="Fraction") + coord_cartesian(ylim = c(0,1)) +  rremove("legend.title") + scale_linetype(name="type") +
+  scale_x_continuous(breaks=c(2006, 2007, 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017)) + scale_color_discrete(name="type") +
+     theme(axis.text.x = element_text(angle = 45, hjust = 1), panel.grid.minor = element_blank()) +
+theme(legend.position = "bottom") + guides(linetype=guide_legend(nrow=2,byrow=TRUE))
+
+b
+
+```
+
+
+
+# Figure S15 & S16
+```{r}
+#This uses the median premium, rather than the mean. 
+
+premdat <- remun_bbrbss %>% left_join(select(bls,everything()), by="year")
+
+premdat <- premdat %>% select(year, fishery_code, crewcount, crewwage, captwage, all_ind_occ, constr_extraction, constr_laborer, all_ind_occ, constr_mgr, oper_eng_constr) %>% gather(occupation, opp_wage, all_ind_occ, constr_extraction, constr_laborer, all_ind_occ, constr_mgr, oper_eng_constr)
+
+premdat <- premdat %>% mutate(
+  #Lwage_prem = log(crewwage) - log(opp_wage),
+  Lwage_prem = crewwage/opp_wage,
+  #Lwage_captprem = log(captwage) - log(opp_wage)
+  Lwage_captprem = captwage/opp_wage
+  ) %>% filter(is.na(Lwage_prem)==FALSE & is.infinite(Lwage_prem)==FALSE) %>% filter(is.na(Lwage_captprem)==FALSE & is.infinite(Lwage_captprem)==FALSE) %>% group_by(year, occupation, fishery_code) %>% summarise(crew.prem.mean = weighted.mean(Lwage_prem, w=crewcount, na.rm = TRUE), crew.prem.med = median(Lwage_prem,na.rm=TRUE), capt.prem.mean = mean(Lwage_captprem, na.rm=TRUE), capt.prem.med = median(Lwage_captprem, na.rm=TRUE)) %>% ungroup()
+
+#Crew
+premfig_crew <- premdat %>% filter(occupation %in% c("all_ind_occ","constr_extraction","constr_laborer")) %>% 
+ggplot(aes(x=year, y=crew.prem.med, color=occupation)) +
+   geom_point() + geom_line(aes(linetype=occupation)) +
+    #stat_summary(fun.y=mean, geom="point", shape=20, size=2, color="black", fill="black") +
+  theme_light() +
+  labs(x="", y="Ratio", title="") + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) + 
+  theme(panel.grid.minor = element_blank()) +
+  scale_x_continuous(breaks=c(1998,2001,2004,2005, 2006, 2007, 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017)) + 
+  rremove("legend.title") + #coord_flip(ylim=c(0,4000)) + 
+  theme(legend.position = "bottom") + facet_wrap(~fishery_code)
+premfig_crew
+
+
+
+#Captain
+premfig_capt <- premdat %>% filter(occupation %in% c("all_ind_occ", "constr_mgr", "oper_eng_constr")) %>% 
+ggplot(aes(x=year, y=capt.prem.med, color=occupation)) +
+   geom_point() + geom_line(aes(linetype=occupation)) +
+  theme_light() +
+  labs(x="", y="Ratio", title="") + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) + 
+  theme(panel.grid.minor = element_blank()) +
+  scale_x_continuous(breaks=c(1998,2001,2004,2005, 2006, 2007, 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017)) + 
+  rremove("legend.title") + #coord_flip(ylim=c(0,4000)) + 
+  theme(legend.position = "bottom") + facet_wrap(~fishery_code)
+premfig_capt
+
+```
+
+
+# Figure 4 & S17
+
+```{r}
+
+axescolor.bbr <- c("gray","gray","gray","black","black","black","black","black","black","black","black","black","black","black","black","black")
+
+axescolor.bss <- c("gray","gray","gray","gray","black","black","black","black","black","black","black","black","black","black","black","black")
+
+temp <- remun_bbrbss %>% filter(postCR=="BEFORE") %>% 
+  group_by(adfg_number_e, fishery_code) %>%
+  summarise(crewwage = median(crewwage, na.rm = TRUE),
+            captwage = median(captwage, na.rm = TRUE),
+            ownerreturn_wage = median(ownerreturn_wage, na.rm = TRUE),
+            capitalreturn_wage = median(capitalreturn_wage, na.rm = TRUE)) %>% 
+  group_by(fishery_code) %>% 
+  mutate(
+  crewwage_group = cut(crewwage, breaks=quantile(crewwage, probs=seq(0,1,0.25)), include.lowest=TRUE, labels=c("Q1","Q2","Q3","Q4")),
+  captwage_group = cut(captwage, breaks=quantile(captwage, probs=seq(0,1,0.25)), include.lowest=TRUE, labels=c("Q1","Q2","Q3","Q4")),
+  ownerreturn_group = cut(ownerreturn_wage, breaks=quantile(ownerreturn_wage, probs=seq(0,1,0.25)), include.lowest=TRUE, labels=c("Q1","Q2","Q3","Q4")),
+  capitalreturn_group = cut(capitalreturn_wage, breaks=quantile(capitalreturn_wage, probs=seq(0,1,0.25)), include.lowest=TRUE, labels=c("Q1","Q2","Q3","Q4"))
+) %>% select(adfg_number_e, fishery_code, crewwage_group, captwage_group, ownerreturn_group, capitalreturn_group)
+
+#Join with remun data
+temp <- remun_bbrbss %>% left_join(temp,by=c("adfg_number_e", "fishery_code"))
+
+#Remove observations where the vessel was not present in a particular fishery pre-ITQ. This can happen since previous participation is predicated on overall participation, not particular fisheries
+
+temp <- temp %>% filter(crewwage_group!="NA")
+
+#BBR############################
+#Crew
+crew.bbr <- temp %>% filter(fishery_code=="BBR") %>% 
+  rename(quartile=crewwage_group, return=crewwage) %>% 
+  group_by(year,quartile) %>% 
+  summarise(return=mean(return)) %>% 
+  ggplot(aes(x=year,y=return, color=quartile, group=quartile, shape=quartile)) + 
+  geom_line(linetype=2) + geom_point() + scale_shape_manual(name="", labels=c("Q1","Q2","Q3","Q4"), values=c(1,1,1,1)) +
+  theme_light() + labs(x="", y="$/day", color="", title="Crew") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+#Captain
+capt.bbr <- temp %>% filter(fishery_code=="BBR") %>% 
+  rename(quartile=captwage_group, return=captwage) %>% 
+  group_by(year,quartile) %>% 
+  summarise(return=mean(return)) %>% 
+  ggplot(aes(x=year,y=return, color=quartile, group=quartile, shape=quartile)) + 
+  geom_line(linetype=2) + geom_point() + scale_shape_manual(name="", labels=c("Q1","Q2","Q3","Q4"), values=c(1,1,1,1)) +
+  theme_light() + labs(x="", y="$/day", color="", title="Captains") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+#Owners
+owner.bbr <- temp %>% filter(fishery_code=="BBR") %>% 
+  rename(quartile=ownerreturn_group, return=ownerreturn_wage) %>% 
+  group_by(year,quartile) %>% 
+  summarise(return=mean(return)) %>% 
+  ggplot(aes(x=year,y=return, color=quartile, group=quartile, shape=quartile)) + 
+  geom_line(linetype=2) + geom_point() + scale_shape_manual(name="", labels=c("Q1","Q2","Q3","Q4"), values=c(1,1,1,1)) +
+  theme_light() + labs(x="", y="$/day", color="", title="Vessel owners") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+#Capital
+capital.bbr <- temp %>% filter(fishery_code=="BBR") %>% 
+  rename(quartile=capitalreturn_group, return=capitalreturn_wage) %>% 
+  group_by(year,quartile) %>% 
+  summarise(return=mean(return)) %>% 
+  ggplot(aes(x=year,y=return, color=quartile, group=quartile, shape=quartile)) + 
+  geom_line(linetype=2) + geom_point() + scale_shape_manual(name="", labels=c("Q1","Q2","Q3","Q4"), values=c(1,1,1,1)) +
+  theme_light() + labs(x="", y="$/day", color="", title="Vessel owners & quota lessors") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+
+#BSS############################
+#Crew
+crew.bss <- temp %>% filter(fishery_code=="BSS") %>% 
+  rename(quartile=crewwage_group, return=crewwage) %>% 
+  group_by(year,quartile) %>% 
+  summarise(return=mean(return)) %>% 
+  ggplot(aes(x=year,y=return, color=quartile, group=quartile, shape=quartile)) + 
+  geom_line(linetype=2) + geom_point() + scale_shape_manual(name="", labels=c("Q1","Q2","Q3","Q4"), values=c(1,1,1,1)) +
+  theme_light() + labs(x="", y="$/day", color="", title="Crew") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+#Captain
+capt.bss <- temp %>% filter(fishery_code=="BSS") %>% 
+  rename(quartile=captwage_group, return=captwage) %>% 
+  group_by(year,quartile) %>% 
+  summarise(return=mean(return)) %>% 
+  ggplot(aes(x=year,y=return, color=quartile, group=quartile, shape=quartile)) + 
+  geom_line(linetype=2) + geom_point() + scale_shape_manual(name="", labels=c("Q1","Q2","Q3","Q4"), values=c(1,1,1,1)) +
+  theme_light() + labs(x="", y="$/day", color="", title="Captains") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+#Owners
+owner.bss <- temp %>% filter(fishery_code=="BSS") %>% 
+  rename(quartile=ownerreturn_group, return=ownerreturn_wage) %>% 
+  group_by(year,quartile) %>% 
+  summarise(return=mean(return)) %>% 
+  ggplot(aes(x=year,y=return, color=quartile, group=quartile, shape=quartile)) + 
+  geom_line(linetype=2) + geom_point() + scale_shape_manual(name="", labels=c("Q1","Q2","Q3","Q4"), values=c(1,1,1,1)) +
+  theme_light() + labs(x="", y="$/day", color="", title="Vessel owners") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+#Capital
+capital.bss <- temp %>% filter(fishery_code=="BSS") %>% 
+  rename(quartile=capitalreturn_group, return=capitalreturn_wage) %>% 
+  group_by(year,quartile) %>% 
+  summarise(return=mean(return)) %>% 
+  ggplot(aes(x=year,y=return, color=quartile, group=quartile, shape=quartile)) + 
+  geom_line(linetype=2) + geom_point() + scale_shape_manual(name="", labels=c("Q1","Q2","Q3","Q4"), values=c(1,1,1,1)) +
+  theme_light() + labs(x="", y="$/day", color="", title="Vessel owners & quota lessors") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+meanret_quartile_bbr <- 
+ggarrange(crew.bbr+theme(axis.text.x = element_blank(),
+                     axis.ticks.x = element_blank(),
+                     axis.title.x = element_blank(), 
+                     panel.grid.minor = element_blank(),
+                plot.margin=margin(t=0,b=0))+scale_x_continuous(breaks=c(1998,2001,2004,2005, 2006, 2007, 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017)), 
+                     capt.bbr+theme(axis.text.x = element_blank(),
+                     axis.ticks.x = element_blank(),
+                     axis.title.x = element_blank(),
+                     panel.grid.minor = element_blank(),
+                  plot.margin=margin(t=0,b=0))+scale_x_continuous(breaks=c(1998,2001,2004,2005, 2006, 2007, 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017)),
+                     owner.bbr+theme(axis.text.x = element_blank(),
+                     axis.ticks.x = element_blank(),
+                     axis.title.x = element_blank(),
+                    panel.grid.minor = element_blank(),
+                  plot.margin=margin(t=0,b=0))+scale_x_continuous(breaks=c(1998,2001,2004,2005, 2006, 2007, 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017)),
+                     capital.bbr+theme(axis.text.x = element_text(color= axescolor.bbr),                     
+                    panel.grid.minor = element_blank(),
+)+scale_x_continuous(breaks=c(1998,2001,2004,2005, 2006, 2007, 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017)), nrow = 4, ncol=1, common.legend = TRUE, legend="bottom", heights=c(1,1,1,1.75), align="v")
+
+
+meanret_quartile_bbr
+
+
+meanret_quartile_bss <- 
+ggarrange(crew.bss+theme(axis.text.x = element_blank(),
+                     axis.ticks.x = element_blank(),
+                     axis.title.x = element_blank(), 
+                     panel.grid.minor = element_blank(),
+                plot.margin=margin(t=0,b=0))+scale_x_continuous(breaks=c(1998,2001,2004,2005, 2006, 2007, 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017)), 
+                     capt.bss+theme(axis.text.x = element_blank(),
+                     axis.ticks.x = element_blank(),
+                     axis.title.x = element_blank(),
+                     panel.grid.minor = element_blank(),
+                  plot.margin=margin(t=0,b=0))+scale_x_continuous(breaks=c(1998,2001,2004,2005, 2006, 2007, 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017)),
+                     owner.bss+theme(axis.text.x = element_blank(),
+                     axis.ticks.x = element_blank(),
+                     axis.title.x = element_blank(),
+                    panel.grid.minor = element_blank(),
+                  plot.margin=margin(t=0,b=0))+scale_x_continuous(breaks=c(1998,2001,2004,2005, 2006, 2007, 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017)),
+                     capital.bss+theme(axis.text.x = element_text(color= axescolor.bss),                     
+                    panel.grid.minor = element_blank(),
+)+scale_x_continuous(breaks=c(1998,2001,2004,2005, 2006, 2007, 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017)), nrow = 4, ncol=1, common.legend = TRUE, legend="bottom", heights=c(1,1,1,1.75), align="v")
+
+meanret_quartile_bss
+
+
+```
+
+# Figure S19 & S20 
+
+
+First make the dataset. 
+```{r}
+ind=c(2004,2011:2017)
+volatility <- list()
+for (i in seq_along(ind)) {
+volatility[[i]] <- remun_bbrbss %>% filter(year==ind[i] | year==ind[i]-3 | year==ind[i]-6) %>% group_by(adfg_number_e, fishery_code) %>% 
+  mutate(
+    crewwage_range = max(crewwage) - min(crewwage),
+    captwage_range = max(captwage) - min(captwage),
+    capitalwage_range  = max(capitalreturn_wage) - min(capitalreturn_wage),
+     ownerwage_range= max(ownerreturn_wage) - min(ownerreturn_wage),
+   allwage_range = max(nrev_nocrew_day) - min(nrev_nocrew_day)
+    
+  ) %>% filter(year==ind[i]) %>% select(year, fishery_code, crewwage_range, captwage_range, capitalwage_range, ownerwage_range, allwage_range, adfg_number_e) %>% arrange(adfg_number_e, fishery_code, year)
+}
+
+volatility <- bind_rows(volatility) %>% ungroup()
+volatility <- volatility %>% mutate(
+  group = case_when(
+    year==2004 ~ "1998,2001,2004",
+    year==2011 ~ "2005,2008,2011", 
+    year==2012 ~ "2006,2009,2012",
+    year==2013 ~ "2007,2010,2013",
+    year==2014 ~ "2008,2011,2014",
+    year==2015 ~ "2009,2012,2015",
+    year==2016 ~ "2010,2013,2016",
+    year==2017 ~ "2011,2014,2017",
+    TRUE ~ "Nada"
+  )
+)
+
+# volatility_bbr <- volatility %>% filter(fishery_code=="BBR")
+# volatility_bss <- volatility %>% filter(fishery_code=="BSS")
+# 
+# crap <- lm_robust(crewwage_range~group, data=volatility_bbr,  clusters = adfg_number_e, se_type = "stata", fixed_effects = adfg_number_e) 
+# crap %>% summary()
+# 
+# crap <- lm_robust(crewwage_range~group, data=volatility_bss,  clusters = adfg_number_e, se_type = "stata", fixed_effects = adfg_number_e) 
+# crap %>% summary()
+
+```
+
+```{r}
+
+#Create 1998/2001/2004 quartiles
+temp <- volatility %>% filter(year==2004) %>% group_by(fishery_code) %>% 
+  mutate(
+  crewwage_group = cut(crewwage_range, breaks=quantile(crewwage_range, probs=seq(0,1,0.25)), include.lowest=TRUE, labels = c("Q1","Q2","Q3","Q4")),
+    captwage_group = cut(captwage_range, breaks=quantile(captwage_range, probs=seq(0,1,0.25)), include.lowest=TRUE, labels = c("Q1","Q2","Q3","Q4")),
+  ownerwage_group = cut(ownerwage_range, breaks=quantile(ownerwage_range, probs=seq(0,1,0.25)), include.lowest=TRUE, labels = c("Q1","Q2","Q3","Q4")),
+  capitalwage_group = cut(capitalwage_range, breaks=quantile(capitalwage_range, probs=seq(0,1,0.25)), include.lowest=TRUE, labels = c("Q1","Q2","Q3","Q4")),
+  allwage_group = cut(allwage_range, breaks=quantile(allwage_range, probs=seq(0,1,0.25)), include.lowest=TRUE, labels = c("Q1","Q2","Q3","Q4"))
+
+  ) %>% select(adfg_number_e,fishery_code, 
+             crewwage_group, captwage_group, ownerwage_group, capitalwage_group, allwage_group
+)
+
+#Join these quartile variables to volatility table
+temp <- volatility %>% left_join(temp,by=c("adfg_number_e", "fishery_code"))
+
+#Remove observations where the vessel was not present in a particular fishery pre-ITQ. This can happen since previous participation is predicated on overall participation, not particular fisheries
+
+temp <- temp %>% filter(crewwage_group!="NA")
+
+#Create pre-ITQ quartile X fishery X year triad mean ranges
+temp1 <- temp %>% group_by(group, crewwage_group, fishery_code) %>% summarise(
+  crewwage_range = mean(crewwage_range)
+) %>% rename(quartile = crewwage_group)
+
+temp2 <- temp %>% group_by(group, ownerwage_group, fishery_code) %>% summarise(
+  ownerwage_range = mean(ownerwage_range)
+) %>% rename(quartile = ownerwage_group)
+
+temp3 <- temp %>% group_by(group, capitalwage_group, fishery_code) %>% summarise(
+  capitalwage_range = mean(capitalwage_range)
+) %>% rename(quartile = capitalwage_group)
+
+temp4 <- temp %>% group_by(group, allwage_group, fishery_code) %>% summarise(
+  allwage_range = mean(allwage_range)
+) %>% rename(quartile = allwage_group)
+
+temp5 <- temp %>% group_by(group, captwage_group, fishery_code) %>% summarise(
+  captwage_range = mean(captwage_range)
+) %>% rename(quartile = captwage_group)
+
+#Merge together
+temp1 <- temp1 %>% left_join(temp2,by=c("group", "fishery_code", "quartile")) %>% left_join(temp3,by=c("group", "fishery_code", "quartile")) %>% left_join(temp4,by=c("group", "fishery_code", "quartile")) %>% left_join(temp5,by=c("group", "fishery_code", "quartile"))
+
+#Create overall fishery X year triad mean ranges
+temp2 <- temp %>% group_by(group, fishery_code) %>% 
+  summarise(
+    crewwage_range = mean(crewwage_range),
+    ownerwage_range = mean(ownerwage_range),
+   capitalwage_range = mean(capitalwage_range),
+   allwage_range = mean(allwage_range),
+   captwage_range = mean(captwage_range)
+  ) %>% mutate(quartile="Mean")
+
+temp1 <- bind_rows(temp1, temp2) %>% arrange(group,fishery_code, quartile)
+
+#Graphs
+#BBR
+crewwage_vol.bbr.fig <- temp1 %>% filter(fishery_code=="BBR" & quartile!="Mean") %>%  ggplot(aes(x=group,y=crewwage_range, color=quartile, group=quartile, shape=quartile)) + 
+  geom_line(linetype=2) + geom_point() + scale_shape_manual(name="", labels=c("Q1","Q2","Q3","Q4"), values=c(1,1,1,1)) +
+  theme_light() + labs(x="Season groups", y="$", color="", title="Crew") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+captwage_vol.bbr.fig <- temp1 %>% filter(fishery_code=="BBR" & quartile!="Mean") %>%  ggplot(aes(x=group,y=captwage_range, color=quartile, group=quartile, shape=quartile)) + 
+  geom_line(linetype=2) + geom_point() + scale_shape_manual(name="", labels=c("Q1","Q2","Q3","Q4"), values=c(1,1,1,1)) +
+  theme_light() + labs(x="Season groups", y="$", color="", title="Captains") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ownerwage_vol.bbr.fig <- temp1 %>% filter(fishery_code=="BBR" & quartile!="Mean") %>%  ggplot(aes(x=group,y=ownerwage_range, color=quartile, group=quartile, shape=quartile)) + 
+  geom_line(linetype=2) + geom_point() + scale_shape_manual(name="", labels=c("Q1","Q2","Q3","Q4"), values=c(1,1,1,1)) +
+  theme_light() + labs(x="Season groups", y="$", color="", title="Vessel owners") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+
+
+capitalwage_vol.bbr.fig <- temp1 %>% filter(fishery_code=="BBR" & quartile!="Mean") %>%  ggplot(aes(x=group,y=capitalwage_range, color=quartile, group=quartile, shape=quartile)) + 
+  geom_line(linetype=2) + geom_point() + scale_shape_manual(name="", labels=c("Q1","Q2","Q3","Q4"), values=c(1,1,1,1)) +
+  theme_light() + labs(x="Season groups", y="$", color="", title="Vessel owners & quota lessors") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+
+allwage_vol.bbr.fig <- temp1 %>% filter(fishery_code=="BBR" & quartile!="Mean") %>%  ggplot(aes(x=group,y=allwage_range, color=quartile, group=quartile, shape=quartile)) + 
+  geom_line(linetype=2) + geom_point() + scale_shape_manual(name="", labels=c("Q1","Q2","Q3","Q4"), values=c(1,1,1,1)) +
+  theme_light() + labs(x="Season groups", y="$", color="", title="All Claimants") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+
+#BSS
+crewwage_vol.bss.fig <- temp1 %>% filter(fishery_code=="BSS" & quartile!="Mean") %>%  ggplot(aes(x=group,y=crewwage_range, color=quartile, group=quartile, shape=quartile)) + 
+  geom_line(linetype=2) + geom_point() + scale_shape_manual(name="", labels=c("Q1","Q2","Q3","Q4"), values=c(1,1,1,1)) +
+  theme_light() + labs(x="Season groups", y="$", color="", title="Crew") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+
+captwage_vol.bss.fig <- temp1 %>% filter(fishery_code=="BSS" & quartile!="Mean") %>%  ggplot(aes(x=group,y=captwage_range, color=quartile, group=quartile, shape=quartile)) + 
+  geom_line(linetype=2) + geom_point() + scale_shape_manual(name="", labels=c("Q1","Q2","Q3","Q4"), values=c(1,1,1,1)) +
+  theme_light() + labs(x="Season groups", y="$", color="", title="Captains") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ownerwage_vol.bss.fig <- temp1 %>% filter(fishery_code=="BSS" & quartile!="Mean") %>%  ggplot(aes(x=group,y=ownerwage_range, color=quartile, group=quartile, shape=quartile)) + 
+  geom_line(linetype=2) + geom_point() + scale_shape_manual(name="", labels=c("Q1","Q2","Q3","Q4"), values=c(1,1,1,1)) +
+  theme_light() + labs(x="Season groups", y="$", color="", title="Vessel owners") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+capitalwage_vol.bss.fig <- temp1 %>% filter(fishery_code=="BSS" & quartile!="Mean") %>%  ggplot(aes(x=group,y=capitalwage_range, color=quartile, group=quartile, shape=quartile)) + 
+  geom_line(linetype=2) + geom_point() + scale_shape_manual(name="", labels=c("Q1","Q2","Q3","Q4"), values=c(1,1,1,1)) +
+  theme_light() + labs(x="Season groups", y="$", color="", title="Vessel owners & quota lessors") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+allwage_vol.bss.fig <- temp1 %>% filter(fishery_code=="BSS" & quartile!="Mean") %>%  ggplot(aes(x=group,y=allwage_range, color=quartile, group=quartile, shape=quartile)) + 
+  geom_line(linetype=2) + geom_point() + scale_shape_manual(name="", labels=c("Q1","Q2","Q3","Q4"), values=c(1,1,1,1)) +
+  theme_light() + labs(x="Season groups", y="$", color="", title="All Claimants") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+vol_bbr_combo <- ggarrange(allwage_vol.bbr.fig+theme(axis.text.x = element_blank(),
+                     axis.ticks.x = element_blank(),
+                     axis.title.x = element_blank(), 
+                     panel.grid.minor = element_blank(),
+                plot.margin=margin(t=0,b=0)), 
+                     crewwage_vol.bbr.fig+theme(axis.text.x = element_blank(),
+                     axis.ticks.x = element_blank(),
+                     axis.title.x = element_blank(),
+                     panel.grid.minor = element_blank(),
+                  plot.margin=margin(t=0,b=0)),
+                captwage_vol.bbr.fig+theme(axis.text.x = element_blank(),
+                     axis.ticks.x = element_blank(),
+                     axis.title.x = element_blank(),
+                     panel.grid.minor = element_blank(),
+                  plot.margin=margin(t=0,b=0)),
+                     ownerwage_vol.bbr.fig+theme(axis.text.x = element_blank(),
+                     axis.ticks.x = element_blank(),
+                     axis.title.x = element_blank(),
+                    panel.grid.minor = element_blank(),
+                  plot.margin=margin(t=0,b=0)),
+                     capitalwage_vol.bbr.fig+theme(                     
+                    panel.grid.minor = element_blank()), nrow = 5, ncol=1, common.legend = TRUE, legend="bottom", heights=c(1,1,1,1,2.25), align="v")
+
+vol_bbr_combo
+
+
+vol_bss_combo <- ggarrange(allwage_vol.bss.fig+theme(axis.text.x = element_blank(),
+                     axis.ticks.x = element_blank(),
+                     axis.title.x = element_blank(), 
+                     panel.grid.minor = element_blank(),
+                plot.margin=margin(t=0,b=0)), 
+                     crewwage_vol.bss.fig+theme(axis.text.x = element_blank(),
+                     axis.ticks.x = element_blank(),
+                     axis.title.x = element_blank(),
+                     panel.grid.minor = element_blank(),
+                  plot.margin=margin(t=0,b=0)),
+                captwage_vol.bss.fig+theme(axis.text.x = element_blank(),
+                     axis.ticks.x = element_blank(),
+                     axis.title.x = element_blank(),
+                     panel.grid.minor = element_blank(),
+                  plot.margin=margin(t=0,b=0)),
+                     ownerwage_vol.bss.fig+theme(axis.text.x = element_blank(),
+                     axis.ticks.x = element_blank(),
+                     axis.title.x = element_blank(),
+                    panel.grid.minor = element_blank(),
+                  plot.margin=margin(t=0,b=0)),
+                     capitalwage_vol.bss.fig+theme(                     
+                    panel.grid.minor = element_blank()), nrow = 5, ncol=1, common.legend = TRUE, legend="bottom", heights=c(1,1,1,1,2.25), align="v")
+
+vol_bss_combo
+
+
+#rm(temp, temp1)
+```
+
+# Figure S18
+```{r}
+
+#Mean range by year. 
+crewwage_vol.mean.fig <- temp1 %>% filter(quartile=="Mean") %>% 
+ggplot(aes(x=group,y=crewwage_range, color=fishery_code, group=fishery_code, shape=fishery_code)) + geom_point() + scale_shape_manual(name="", labels=c("BBR","BSS"), values=c(1,1)) + geom_line(linetype=2) + theme_light() + labs(x="Season groups", y="$", color="", title="Crew") + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+captwage_vol.mean.fig <- temp1 %>% filter(quartile=="Mean") %>% 
+ggplot(aes(x=group,y=captwage_range, color=fishery_code, group=fishery_code, shape=fishery_code)) + geom_point() + scale_shape_manual(name="", labels=c("BBR","BSS"), values=c(1,1)) + geom_line(linetype=2)  + theme_light() + labs(x="Season groups", y="$", color="", title="Captains") + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ownerwage_vol.mean.fig <- temp1 %>% filter(quartile=="Mean") %>% 
+ggplot(aes(x=group,y=ownerwage_range, color=fishery_code, group=fishery_code, shape=fishery_code)) + geom_point() + scale_shape_manual(name="", labels=c("BBR","BSS"), values=c(1,1)) + geom_line(linetype=2) + theme_light() + labs(x="Season groups", y="$", color="", title="Vessel owners") + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+capitalwage_vol.mean.fig <- temp1 %>% filter(quartile=="Mean") %>% 
+ggplot(aes(x=group,y=capitalwage_range, color=fishery_code, group=fishery_code, shape=fishery_code)) + geom_point() + scale_shape_manual(name="", labels=c("BBR","BSS"), values=c(1,1)) + geom_line(linetype=2) + theme_light() + labs(x="Season groups", y="$", color="", title="Vessel owners & quota lessors") + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+allwage_vol.mean.fig <- temp1 %>% filter(quartile=="Mean") %>% 
+ggplot(aes(x=group,y=allwage_range, color=fishery_code, group=fishery_code, shape=fishery_code)) + geom_point() + scale_shape_manual(name="", labels=c("BBR","BSS"), values=c(1,1)) + geom_line(linetype=2) + theme_light() + labs(x="Season groups", y="$", color="", title="All Claimants") + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+vol_mean_combo <- ggarrange(allwage_vol.mean.fig+theme(axis.text.x = element_blank(),
+                     axis.ticks.x = element_blank(),
+                     axis.title.x = element_blank(), 
+                     panel.grid.minor = element_blank(),
+                plot.margin=margin(t=0,b=0)), 
+                     crewwage_vol.mean.fig+theme(axis.text.x = element_blank(),
+                     axis.ticks.x = element_blank(),
+                     axis.title.x = element_blank(),
+                     panel.grid.minor = element_blank(),
+                  plot.margin=margin(t=0,b=0)),
+                captwage_vol.mean.fig+theme(axis.text.x = element_blank(),
+                     axis.ticks.x = element_blank(),
+                     axis.title.x = element_blank(),
+                     panel.grid.minor = element_blank(),
+                  plot.margin=margin(t=0,b=0)),
+                     ownerwage_vol.mean.fig+theme(axis.text.x = element_blank(),
+                     axis.ticks.x = element_blank(),
+                     axis.title.x = element_blank(),
+                    panel.grid.minor = element_blank(),
+                  plot.margin=margin(t=0,b=0)),
+                     capitalwage_vol.mean.fig+theme(                     
+                    panel.grid.minor = element_blank()), nrow = 5, ncol=1, common.legend = TRUE, legend="bottom", heights=c(1,1,1,1,2.25), align="v")
+
+vol_mean_combo
+
+```
+
+# Figure S21
+
+```{r}
+
+axescolor.bbr <- c("gray","gray","gray","black","black","black","black","black","black","black","black","black","black","black","black","black")
+axescolor.bss <- c("gray","gray","gray","gray","black","black","black","black","black","black","black","black","black","black","black","black")
+
+
+#Quantile regression
+
+#BBR 
+
+temp <- remun_bbr %>% filter(postCR=="AFTER") %>% group_by(year) %>%
+  summarise(lrat = sum(qslb)/sum(exvlb))
+
+depvar <- "leasedratio"
+dat <- remun_bbr %>% filter(postCR=="AFTER")
+form <- as.formula(paste0(depvar,"~", "factor(year)-1"))
+a <- rq(form, tau=c(.1,.25,.5,.75,.9), data=dat, model=TRUE)
+b <- summary(a)
+q10 <- b[[1]]$coefficients[1:13] %>% tidy() %>% mutate(quantile="q10", year=c(2005:2017))
+q25 <- b[[2]]$coefficients[1:13] %>% tidy() %>% mutate(quantile="q25", year=c(2005:2017))
+q50 <- b[[3]]$coefficients[1:13] %>% tidy() %>% mutate(quantile="q50", year=c(2005:2017))
+q75 <- b[[4]]$coefficients[1:13] %>% tidy() %>% mutate(quantile="q75", year=c(2005:2017))
+q90 <- b[[5]]$coefficients[1:13] %>% tidy() %>% mutate(quantile="q90", year=c(2005:2017))
+c <- rbind(q10,q25,q50,q75,q90) %>% left_join(temp,by=c("year"))
+
+
+leasedtrend.bbr <- c %>%
+  ggplot(aes(x=year, y=x, color=quantile)) +
+  geom_line(alpha=0.5) +
+  geom_line(aes(x=year, y=lrat, color="Overall"), size=1) +
+  geom_point(size=1) + 
+  theme_light() +
+  labs(y="Share", title="BBR", x="") +
+   rremove("legend.title") +
+  theme(panel.grid.minor = element_blank()) +
+  scale_x_continuous(breaks=c(1998,2001,2004,2005, 2006, 2007, 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017)) +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1), legend.position = "bottom") + theme(axis.text.x = element_text(color = axescolor.bbr))
+leasedtrend.bbr
+
+
+
+#BSS
+
+temp <- remun_bss %>% filter(postCR=="AFTER") %>% group_by(year) %>%
+  summarise(lrat = sum(qslb)/sum(exvlb))
+
+depvar <- "leasedratio"
+dat <- remun_bss %>% filter(postCR=="AFTER")
+form <- as.formula(paste0(depvar,"~", "factor(year)-1"))
+a <- rq(form, tau=c(.1,.25,.5,.75,.9), data=dat, model=TRUE)
+b <- summary(a)
+q10 <- b[[1]]$coefficients[1:12] %>% tidy() %>% mutate(quantile="q10", year=c(2006:2017))
+q25 <- b[[2]]$coefficients[1:12] %>% tidy() %>% mutate(quantile="q25", year=c(2006:2017))
+q50 <- b[[3]]$coefficients[1:12] %>% tidy() %>% mutate(quantile="q50", year=c(2006:2017))
+q75 <- b[[4]]$coefficients[1:12] %>% tidy() %>% mutate(quantile="q75", year=c(2006:2017))
+q90 <- b[[5]]$coefficients[1:12] %>% tidy() %>% mutate(quantile="q90", year=c(2006:2017))
+c <- rbind(q10,q25,q50,q75,q90) %>% left_join(temp,by=c("year"))
+
+leasedtrend.bss <- c %>%
+  ggplot(aes(x=year, y=x, color=quantile)) +
+  geom_line(alpha=0.5) +
+  geom_line(aes(x=year, y=lrat, color="Overall"), size=1) +
+  geom_point(size=1) + 
+  theme_light() +
+  labs(y="Share", title="BSS", x="") +
+   rremove("legend.title") +
+  theme(panel.grid.minor = element_blank()) +
+  scale_x_continuous(breaks=c(1998,2001,2004,2005, 2006, 2007, 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017)) +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1), legend.position = "bottom") + theme(axis.text.x = element_text(color = axescolor.bss))
+leasedtrend.bss
+
+leasedtrend <- ggarrange(leasedtrend.bbr, leasedtrend.bss, nrow=1, ncol=2, common.legend = TRUE, legend="bottom")
+leasedtrend
+
+```
+
+
+
+# Figure S22 & S23
+```{r}
+
+#BBR
+#$/MT
+f <- remun_bbrbss %>% filter(fishery_code=="BBR") %>% ggplot(aes(x=qspriceMT/1000, y=factor(year))) + geom_density_ridges_gradient(aes(fill=factor(stat(quantile)), height=..ndensity..),  quantile_lines = TRUE, calc_ecdf=TRUE, quantiles = 4, scale=1.5, rel_min_height=0.01) + theme_ridges() + rremove("legend.title") + labs(x="$(1000s)/MT", y="") + scale_x_continuous(limits=c(0,15)) + scale_fill_viridis_d(name="Quartiles", option="inferno", alpha=1) + theme(legend.position = "none")
+
+#Share of ex-vessel price
+g <- remun_bbrbss %>% filter(fishery_code=="BBR") %>% ggplot(aes(x=qsevratio*100, y=factor(year))) + geom_density_ridges_gradient(aes(fill=factor(stat(quantile)), height=..ndensity..),  quantile_lines = TRUE, calc_ecdf=TRUE, quantiles = 4, scale=1.5, rel_min_height=0.01) + theme_ridges() + rremove("legend.title") + labs(x="% ex. vessel price ", y="") + scale_x_continuous(limits=c(25,110)) + scale_fill_viridis_d(name="Quartiles", option="inferno", alpha=1) + theme(legend.position = "none")
+
+
+#Lease comparison
+lease_rate_bbr <- ggarrange(f,g+theme(axis.text.y = element_blank(),
+                     axis.ticks.y = element_blank(),
+                     axis.title.y = element_blank()), nrow = 1, ncol=2, widths = c(1,1))
+lease_rate_bbr
+
+#BSS
+
+
+#BBR
+#$/MT
+f <- remun_bbrbss %>% filter(fishery_code=="BSS") %>% ggplot(aes(x=qspriceMT/1000, y=factor(year))) + geom_density_ridges_gradient(aes(fill=factor(stat(quantile)), height=..ndensity..),  quantile_lines = TRUE, calc_ecdf=TRUE, quantiles = 4, scale=1.5, rel_min_height=0.01) + theme_ridges() + rremove("legend.title") + labs(x="$(1000s)/MT", y="") + scale_x_continuous(limits=c(0,4)) + scale_fill_viridis_d(name="Quartiles", option="inferno", alpha=1) + theme(legend.position = "none")
+
+#Share of ex-vessel price
+g <- remun_bbrbss %>% filter(fishery_code=="BSS") %>% ggplot(aes(x=qsevratio*100, y=factor(year))) + geom_density_ridges_gradient(aes(fill=factor(stat(quantile)), height=..ndensity..),  quantile_lines = TRUE, calc_ecdf=TRUE, quantiles = 4, scale=1.5, rel_min_height=0.01) + theme_ridges() + rremove("legend.title") + labs(x="% ex. vessel price ", y="") + scale_x_continuous(limits=c(30,60)) + scale_fill_viridis_d(name="Quartiles", option="inferno", alpha=1) + theme(legend.position = "none")
+
+
+#Lease comparison
+lease_rate_bss <- ggarrange(f,g+theme(axis.text.y = element_blank(),
+                     axis.ticks.y = element_blank(),
+                     axis.title.y = element_blank()), nrow = 1, ncol=2, widths = c(1,1))
+lease_rate_bss
+
+
+
+```
+
+
+# Figure S24
+```{r}
+temp <- remun_bbrbss %>% filter(postCR=="BEFORE") %>% 
+  group_by(adfg_number_e, fishery_code) %>%
+  summarise(crewwage = median(crewwage, na.rm = TRUE),
+            captwage = median(captwage, na.rm = TRUE),
+            ownerreturn_wage = median(ownerreturn_wage, na.rm = TRUE),
+            capitalreturn_wage = median(capitalreturn_wage, na.rm = TRUE)) %>% 
+  group_by(fishery_code) %>% 
+  mutate(
+  crewwage_group = cut(crewwage, breaks=quantile(crewwage, probs=seq(0,1,0.25)), include.lowest=TRUE, labels=c("Q1","Q2","Q3","Q4")),
+  captwage_group = cut(captwage, breaks=quantile(captwage, probs=seq(0,1,0.25)), include.lowest=TRUE, labels=c("Q1","Q2","Q3","Q4")),
+  ownerreturn_group = cut(ownerreturn_wage, breaks=quantile(ownerreturn_wage, probs=seq(0,1,0.25)), include.lowest=TRUE, labels=c("Q1","Q2","Q3","Q4")),
+  capitalreturn_group = cut(capitalreturn_wage, breaks=quantile(capitalreturn_wage, probs=seq(0,1,0.25)), include.lowest=TRUE, labels=c("Q1","Q2","Q3","Q4"))
+) %>% select(adfg_number_e, fishery_code, crewwage_group, captwage_group, ownerreturn_group, capitalreturn_group)
+
+#Join with remun data
+temp <- remun_bbrbss %>% left_join(temp,by=c("adfg_number_e", "fishery_code"))
+
+#Remove observations where the vessel was not present in a particular fishery pre-ITQ. This can happen since previous participation is predicated on overall participation, not particular fisheries
+
+temp <- temp %>% filter(crewwage_group!="NA")
+
+#
+# 
+a <- temp %>% filter(postCR=="AFTER") %>% ggplot(aes(x=factor(year), y=(qscost/tripd), fill=ownerreturn_group)) +
+  geom_boxplot(outlier.shape = NA) +
+  theme_light() +
+  labs(x="Year", y="$/day", fill="Quartile") +
+  facet_wrap(~fishery_code, scales="free", nrow=2) + theme(axis.text.x = element_text(angle = 90, hjust = 1)) + rremove("legend.title") #coord_cartesian(ylim=c(0,1))
+
+a
+```
+
+# Table 1 & S1
+```{r}
+
+##BBR
+#Worker wage regressions
+temp <- remun_bbr %>% filter(postCR=="AFTER") %>% mutate(leasedratio=leasedratio+0, price=revmt, ownerwage = ownerreturn/tripd, workerwage = (crewcost+captcost)/tripd, contribshare = 1-cost_nocrew_share ) %>% filter(contribshare>0)
+
+#Base
+worker.base <- lm_robust(log(workerwage) ~ leasedratio, data=temp, clusters=adfg_number_e, se_type="stata")
+worker.base %>% summary()
+worker.base <- extract.lm_robust(worker.base,include.ci=FALSE, include.rsquared = TRUE, include.adjrs = FALSE, include.nclusts = FALSE, include.nobs = TRUE, include.fstatistic = FALSE, include.rmse = FALSE)
+#Base + log controls
+worker.controls <- lm_robust(log(workerwage) ~ leasedratio + log(vprod) + log(price)+factor(year)+log(contribshare), data=temp, clusters=adfg_number_e, se_type="stata")
+worker.controls %>% summary()
+worker.controls <- extract.lm_robust(worker.controls,include.ci=FALSE, include.rsquared = TRUE, include.adjrs = FALSE, include.nclusts = FALSE, include.nobs = TRUE, include.fstatistic = FALSE, include.rmse = FALSE)
+#Base + log controls + vessel FEs
+worker.controls.fe <- lm_robust(log(workerwage) ~ leasedratio + log(vprod) + log(price) + factor(year)+log(contribshare), data=temp, fixed_effects = adfg_number_e, clusters=adfg_number_e, se_type="stata")
+worker.controls.fe %>% summary()
+worker.controls.fe <- extract.lm_robust(worker.controls.fe,include.ci=FALSE, include.rsquared = TRUE, include.adjrs = FALSE, include.nclusts = FALSE, include.nobs = TRUE, include.fstatistic = FALSE, include.rmse = FALSE)
+
+
+#Owner return regressions
+
+#Base
+shift <- 60772 #min is -60771
+owner.base <- lm_robust(log(ownerwage+shift) ~ leasedratio, data=temp, clusters=adfg_number_e, se_type="stata")
+owner.base %>% summary()
+owner.base <- extract.lm_robust(owner.base,include.ci=FALSE, include.rsquared = TRUE, include.adjrs = FALSE, include.nclusts = FALSE, include.nobs = TRUE, include.fstatistic = FALSE, include.rmse = FALSE)
+#Base + log controls
+owner.controls <- lm_robust(log(ownerwage+shift) ~ leasedratio+ log(vprod) + log(price)+factor(year)+log(contribshare), data=temp, clusters=adfg_number_e, se_type="stata")
+owner.controls %>% summary()
+owner.controls <- extract.lm_robust(owner.controls,include.ci=FALSE, include.rsquared = TRUE, include.adjrs = FALSE, include.nclusts = FALSE, include.nobs = TRUE, include.fstatistic = FALSE, include.rmse = FALSE)
+#Base + log controls + vessel FEs
+owner.controls.fe <- lm_robust(log(ownerwage+shift) ~ leasedratio + log(vprod) + log(price) + factor(year)+log(contribshare), data=temp, fixed_effects = adfg_number_e, clusters=adfg_number_e, se_type="stata")
+owner.controls.fe %>% summary()
+owner.controls.fe <- extract.lm_robust(owner.controls.fe,include.ci=FALSE, include.rsquared = TRUE, include.adjrs = FALSE, include.nclusts = FALSE, include.nobs = TRUE, include.fstatistic = FALSE, include.rmse = FALSE)
+
+leaseRORreg.bbr <- texreg(list(worker.base, worker.controls, worker.controls.fe, owner.base, owner.controls, owner.controls.fe), dcolumn=TRUE, booktabs=TRUE, use.packages = FALSE, center=TRUE, custom.model.names = c("Base","Controls","FEs","Base","Controls","FEs"), custom.header=list("log(labor cost/day)"=1:3,"log(owner return/day)"=4:6), omit.coef = "factor", label="tab:leaseRORreg.bbr", caption="Regressions of daily remuneration to all workers (crew and captains) and owners on the share of leased quota for the BBR fishery. All regressions with controls also include year dummy variables (not shown). The minimum daily return to owners (-60,771), plus one, is added to owner return prior to the log transformation to ensure positivity.", float.pos="hbtb", custom.note = "%stars. Cluster-robust SEs (cluster=vessel ID) are reported.", table=FALSE)
+write(leaseRORreg.bbr, file=paste0(export.base,"/leaseRORreg_bbr.tex"))
+
+
+
+
+##BSS
+#Worker wage regressions
+temp <- remun_bss %>% filter(postCR=="AFTER") %>% mutate(leasedratio=leasedratio+0, price=revmt, ownerwage = ownerreturn/tripd, workerwage = (crewcost+captcost)/tripd, cost_share = cost_nocrew_share,contribshare = 1-cost_nocrew_share  ) %>% filter(contribshare>0)
+
+#Base
+worker.base <- lm_robust(log(workerwage) ~ leasedratio, data=temp, clusters=adfg_number_e, se_type="stata")
+worker.base %>% summary()
+worker.base <- extract.lm_robust(worker.base,include.ci=FALSE, include.rsquared = TRUE, include.adjrs = FALSE, include.nclusts = FALSE, include.nobs = TRUE, include.fstatistic = FALSE, include.rmse = FALSE)
+#Base + log controls
+worker.controls <- lm_robust(log(workerwage) ~ leasedratio + log(vprod) + log(price)+factor(year)+log(contribshare), data=temp, clusters=adfg_number_e, se_type="stata")
+worker.controls %>% summary()
+worker.controls <- extract.lm_robust(worker.controls,include.ci=FALSE, include.rsquared = TRUE, include.adjrs = FALSE, include.nclusts = FALSE, include.nobs = TRUE, include.fstatistic = FALSE, include.rmse = FALSE)
+#Base + log controls + vessel FEs
+worker.controls.fe <- lm_robust(log(workerwage) ~ leasedratio + log(vprod) + log(price) + factor(year)+log(contribshare), data=temp, fixed_effects = adfg_number_e, clusters=adfg_number_e, se_type="stata")
+worker.controls.fe %>% summary()
+worker.controls.fe <- extract.lm_robust(worker.controls.fe,include.ci=FALSE, include.rsquared = TRUE, include.adjrs = FALSE, include.nclusts = FALSE, include.nobs = TRUE, include.fstatistic = FALSE, include.rmse = FALSE)
+
+
+#Owner return regressions
+
+#Base
+shift <- 29319 #min is -29318
+owner.base <- lm_robust(log(ownerwage+shift) ~ leasedratio, data=temp, clusters=adfg_number_e, se_type="stata")
+owner.base %>% summary()
+owner.base <- extract.lm_robust(owner.base,include.ci=FALSE, include.rsquared = TRUE, include.adjrs = FALSE, include.nclusts = FALSE, include.nobs = TRUE, include.fstatistic = FALSE, include.rmse = FALSE)
+#Base + log controls
+owner.controls <- lm_robust(log(ownerwage+shift) ~ leasedratio + log(vprod) + log(price)+factor(year)+log(contribshare), data=temp, clusters=adfg_number_e, se_type="stata")
+owner.controls %>% summary()
+owner.controls <- extract.lm_robust(owner.controls,include.ci=FALSE, include.rsquared = TRUE, include.adjrs = FALSE, include.nclusts = FALSE, include.nobs = TRUE, include.fstatistic = FALSE, include.rmse = FALSE)
+#Base + log controls + vessel FEs
+owner.controls.fe <- lm_robust(log(ownerwage+shift) ~ leasedratio + log(vprod) + log(price) + factor(year)+log(contribshare), data=temp, fixed_effects = adfg_number_e, clusters=adfg_number_e, se_type="stata")
+owner.controls.fe %>% summary()
+owner.controls.fe <- extract.lm_robust(owner.controls.fe,include.ci=FALSE, include.rsquared = TRUE, include.adjrs = FALSE, include.nclusts = FALSE, include.nobs = TRUE, include.fstatistic = FALSE, include.rmse = FALSE)
+
+leaseRORreg.bss <- texreg(list(worker.base, worker.controls, worker.controls.fe, owner.base, owner.controls, owner.controls.fe), dcolumn=TRUE, booktabs=TRUE, use.packages = FALSE, center=TRUE, custom.model.names = c("Base","Controls","FEs","Base","Controls","FEs"), custom.header=list("log(labor cost/day)"=1:3,"log(owner return/day)"=4:6), omit.coef = "factor", label="tab:leaseRORreg.bss", caption="Regressions of daily remuneration to workers (crew and captains) and owners on the share of leased quota for the BSS fishery. All regressions with controls also include year dummy variables (not shown). The minimum daily return to owners (-29,318), plus one, is added to owner return prior to the log transformation to ensure positivity.", float.pos="hbtb", custom.note = "%stars. Cluster-robust SEs (cluster=vessel ID) are reported.")
+write(leaseRORreg.bss, file=paste0(export.base,"/leaseRORreg.bss.tex"))
+
+
+
+
+
+```
+
+# Table S2 & S3
+```{r}
+
+
+##BBR
+#Worker wage regressions
+temp <- remun_bbr %>% filter(postCR=="AFTER") %>% mutate(leasedratio=leasedratio+0, price=revmt, ownerwage = ownerreturn/tripd, workerwage = (crewcost+captcost)/tripd, contribshare = 1-cost_nocrew_share ) %>% filter(contribshare>0)
+
+#Base
+worker.base <- lm_robust(workerwage ~ leasedratio, data=temp, clusters=adfg_number_e, se_type="stata")
+worker.base %>% summary()
+worker.base <- extract.lm_robust(worker.base,include.ci=FALSE, include.rsquared = TRUE, include.adjrs = FALSE, include.nclusts = FALSE, include.nobs = TRUE, include.fstatistic = FALSE, include.rmse = FALSE)
+#Base + log controls
+worker.controls <- lm_robust(workerwage ~ leasedratio + vprod + price+factor(year)+contribshare, data=temp, clusters=adfg_number_e, se_type="stata")
+worker.controls %>% summary()
+worker.controls <- extract.lm_robust(worker.controls,include.ci=FALSE, include.rsquared = TRUE, include.adjrs = FALSE, include.nclusts = FALSE, include.nobs = TRUE, include.fstatistic = FALSE, include.rmse = FALSE)
+#Base + log controls + vessel FEs
+worker.controls.fe <- lm_robust(workerwage ~ leasedratio + vprod + price + factor(year)+contribshare, data=temp, fixed_effects = adfg_number_e, clusters=adfg_number_e, se_type="stata")
+worker.controls.fe %>% summary()
+worker.controls.fe <- extract.lm_robust(worker.controls.fe,include.ci=FALSE, include.rsquared = TRUE, include.adjrs = FALSE, include.nclusts = FALSE, include.nobs = TRUE, include.fstatistic = FALSE, include.rmse = FALSE)
+
+
+#Owner return regressions
+
+#Base
+shift <- 60772 #min is -60771
+owner.base <- lm_robust(ownerwage ~ leasedratio, data=temp, clusters=adfg_number_e, se_type="stata")
+owner.base %>% summary()
+owner.base <- extract.lm_robust(owner.base,include.ci=FALSE, include.rsquared = TRUE, include.adjrs = FALSE, include.nclusts = FALSE, include.nobs = TRUE, include.fstatistic = FALSE, include.rmse = FALSE)
+#Base + log controls
+owner.controls <- lm_robust(ownerwage ~ leasedratio+ vprod + price+factor(year)+contribshare, data=temp, clusters=adfg_number_e, se_type="stata")
+owner.controls %>% summary()
+owner.controls <- extract.lm_robust(owner.controls,include.ci=FALSE, include.rsquared = TRUE, include.adjrs = FALSE, include.nclusts = FALSE, include.nobs = TRUE, include.fstatistic = FALSE, include.rmse = FALSE)
+#Base + log controls + vessel FEs
+owner.controls.fe <- lm_robust(ownerwage ~ leasedratio + vprod + price + factor(year)+contribshare, data=temp, fixed_effects = adfg_number_e, clusters=adfg_number_e, se_type="stata")
+owner.controls.fe %>% summary()
+owner.controls.fe <- extract.lm_robust(owner.controls.fe,include.ci=FALSE, include.rsquared = TRUE, include.adjrs = FALSE, include.nclusts = FALSE, include.nobs = TRUE, include.fstatistic = FALSE, include.rmse = FALSE)
+# 
+leaseRORreg.bbr <- texreg(list(worker.base, worker.controls, worker.controls.fe, owner.base, owner.controls, owner.controls.fe), dcolumn=TRUE, booktabs=TRUE, use.packages = FALSE, center=TRUE, custom.model.names = c("Base","Controls","FEs","Base","Controls","FEs"), custom.header=list("labor cost/day"=1:3,"owner return/day"=4:6), omit.coef = "factor", label="tab:leaseRORregLINEAR.bbr", caption="Regressions of daily remuneration to all workers (crew and captains) and owners on the share of leased quota for the BBR fishery. All regressions with controls also include year dummy variables (not shown).", float.pos="hbtb", custom.note = "%stars. Cluster-robust SEs (cluster=vessel ID) are reported.")
+write(leaseRORreg.bbr, file=paste0(export.base,"/leaseRORregLINEAR.bbr.tex"))
+
+
+
+
+##BSS
+#Worker wage regressions
+temp <- remun_bss %>% filter(postCR=="AFTER") %>% mutate(leasedratio=leasedratio+0, price=revmt, ownerwage = ownerreturn/tripd, workerwage = (crewcost+captcost)/tripd, cost_share = cost_nocrew_share,contribshare = 1-cost_nocrew_share  ) %>% filter(contribshare>0)
+
+#Base
+worker.base <- lm_robust(workerwage ~ leasedratio, data=temp, clusters=adfg_number_e, se_type="stata")
+worker.base %>% summary()
+worker.base <- extract.lm_robust(worker.base,include.ci=FALSE, include.rsquared = TRUE, include.adjrs = FALSE, include.nclusts = FALSE, include.nobs = TRUE, include.fstatistic = FALSE, include.rmse = FALSE)
+#Base + log controls
+worker.controls <- lm_robust(workerwage ~ leasedratio + vprod + price+factor(year)+contribshare, data=temp, clusters=adfg_number_e, se_type="stata")
+worker.controls %>% summary()
+worker.controls <- extract.lm_robust(worker.controls,include.ci=FALSE, include.rsquared = TRUE, include.adjrs = FALSE, include.nclusts = FALSE, include.nobs = TRUE, include.fstatistic = FALSE, include.rmse = FALSE)
+#Base + log controls + vessel FEs
+worker.controls.fe <- lm_robust(workerwage ~ leasedratio + vprod + price + factor(year)+contribshare, data=temp, fixed_effects = adfg_number_e, clusters=adfg_number_e, se_type="stata")
+worker.controls.fe %>% summary()
+worker.controls.fe <- extract.lm_robust(worker.controls.fe,include.ci=FALSE, include.rsquared = TRUE, include.adjrs = FALSE, include.nclusts = FALSE, include.nobs = TRUE, include.fstatistic = FALSE, include.rmse = FALSE)
+
+
+#Owner return regressions
+
+#Base
+shift <- 29319 #min is -29318
+owner.base <- lm_robust(ownerwage ~ leasedratio, data=temp, clusters=adfg_number_e, se_type="stata")
+owner.base %>% summary()
+owner.base <- extract.lm_robust(owner.base,include.ci=FALSE, include.rsquared = TRUE, include.adjrs = FALSE, include.nclusts = FALSE, include.nobs = TRUE, include.fstatistic = FALSE, include.rmse = FALSE)
+#Base + log controls
+owner.controls <- lm_robust(ownerwage ~ leasedratio + vprod + price+factor(year)+contribshare, data=temp, clusters=adfg_number_e, se_type="stata")
+owner.controls %>% summary()
+owner.controls <- extract.lm_robust(owner.controls,include.ci=FALSE, include.rsquared = TRUE, include.adjrs = FALSE, include.nclusts = FALSE, include.nobs = TRUE, include.fstatistic = FALSE, include.rmse = FALSE)
+#Base + log controls + vessel FEs
+owner.controls.fe <- lm_robust(ownerwage ~ leasedratio + vprod + price + factor(year)+contribshare, data=temp, fixed_effects = adfg_number_e, clusters=adfg_number_e, se_type="stata")
+owner.controls.fe %>% summary()
+owner.controls.fe <- extract.lm_robust(owner.controls.fe,include.ci=FALSE, include.rsquared = TRUE, include.adjrs = FALSE, include.nclusts = FALSE, include.nobs = TRUE, include.fstatistic = FALSE, include.rmse = FALSE)
+# 
+leaseRORreg.bss <- texreg(list(worker.base, worker.controls, worker.controls.fe, owner.base, owner.controls, owner.controls.fe), dcolumn=TRUE, booktabs=TRUE, use.packages = FALSE, center=TRUE, custom.model.names = c("Base","Controls","FEs","Base","Controls","FEs"), custom.header=list("labor cost/day"=1:3,"owner return/day"=4:6), omit.coef = "factor", label="tab:leaseRORregLINEAR.bss", caption="Regressions of daily remuneration to workers (crew and captains) and owners on the share of leased quota for the BSS fishery. All regressions with controls also include year dummy variables (not shown).", float.pos="hbtb", custom.note = "%stars. Cluster-robust SEs (cluster=vessel ID) are reported.")
+write(leaseRORreg.bss, file=paste0(export.base,"/leaseRORregLINEAR.bss.tex"))
+
+
+
+
+
+```
+
+
+
+
